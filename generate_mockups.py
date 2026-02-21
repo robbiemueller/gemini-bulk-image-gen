@@ -38,9 +38,17 @@ SCRIPT_DIR = Path(__file__).parent
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif"}
 
-# gemini-2.5-flash-image  = faster, cheaper
-# gemini-3-pro-image-preview = higher quality, slower
-DEFAULT_MODEL = "gemini-3-pro-image-preview"
+MODELS = [
+    "gemini-3-pro-image-preview",    # highest quality, 4K support
+    "gemini-2.5-flash-image",        # faster, cheaper
+]
+DEFAULT_MODEL = MODELS[0]
+
+ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "4:5", "5:4", "2:3", "3:2", "21:9"]
+DEFAULT_ASPECT_RATIO = "1:1"
+
+IMAGE_SIZES = ["1K", "2K", "4K"]
+DEFAULT_IMAGE_SIZE = "1K"
 
 DEFAULT_PROMPT = (
     "take the print from this image and create a square aspect ratio hero mockup photo "
@@ -86,7 +94,9 @@ def extract_retry_delay(error_message: str) -> int:
 
 
 def process_image(client: genai.Client, model: str, prompt: str,
-                  image_path: Path, output_path: Path) -> bool:
+                  image_path: Path, output_path: Path,
+                  aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+                  image_size: str = DEFAULT_IMAGE_SIZE) -> bool:
     mime_type = MIME_MAP.get(image_path.suffix.lower(), "image/jpeg")
     with open(image_path, "rb") as f:
         image_bytes = f.read()
@@ -101,6 +111,10 @@ def process_image(client: genai.Client, model: str, prompt: str,
                 ],
                 config=types.GenerateContentConfig(
                     response_modalities=["IMAGE", "TEXT"],
+                    image_config=types.ImageConfig(
+                        aspect_ratio=aspect_ratio,
+                        image_size=image_size,
+                    ),
                 ),
             )
             for part in response.candidates[0].content.parts:
@@ -153,8 +167,13 @@ class App(tk.Tk):
         # --- Model ---
         tk.Label(self, text="Model:", anchor="w").grid(row=1, column=0, sticky="w", **pad)
         self.model_var = tk.StringVar(value=DEFAULT_MODEL)
-        tk.Entry(self, textvariable=self.model_var, width=50).grid(
-            row=1, column=1, columnspan=2, sticky="ew", **pad)
+        model_frame = tk.Frame(self)
+        model_frame.grid(row=1, column=1, columnspan=2, sticky="ew", **pad)
+        model_combo = ttk.Combobox(model_frame, textvariable=self.model_var,
+                                   values=MODELS, width=38)
+        model_combo.pack(side="left")
+        tk.Label(model_frame, text="  (or type a custom model ID)", fg="gray",
+                 font=("TkDefaultFont", 8)).pack(side="left")
 
         # --- Input folder ---
         tk.Label(self, text="Input folder:", anchor="w").grid(row=2, column=0, sticky="w", **pad)
@@ -173,9 +192,24 @@ class App(tk.Tk):
             row=3, column=2, sticky="w", padx=(0, 10))
 
         # --- Options ---
+        options_frame = tk.Frame(self)
+        options_frame.grid(row=4, column=1, columnspan=2, sticky="w", **pad)
+
         self.overwrite_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(self, text="Overwrite existing outputs", variable=self.overwrite_var).grid(
-            row=4, column=1, sticky="w", **pad)
+        tk.Checkbutton(options_frame, text="Overwrite existing outputs",
+                       variable=self.overwrite_var).pack(side="left", padx=(0, 20))
+
+        tk.Label(options_frame, text="Aspect ratio:").pack(side="left")
+        self.aspect_ratio_var = tk.StringVar(value=DEFAULT_ASPECT_RATIO)
+        ttk.Combobox(options_frame, textvariable=self.aspect_ratio_var,
+                     values=ASPECT_RATIOS, width=6, state="readonly").pack(side="left", padx=(4, 16))
+
+        tk.Label(options_frame, text="Resolution:").pack(side="left")
+        self.image_size_var = tk.StringVar(value=DEFAULT_IMAGE_SIZE)
+        ttk.Combobox(options_frame, textvariable=self.image_size_var,
+                     values=IMAGE_SIZES, width=4, state="readonly").pack(side="left", padx=(4, 0))
+        tk.Label(options_frame, text="(4K: pro model only)", fg="gray",
+                 font=("TkDefaultFont", 8)).pack(side="left", padx=(6, 0))
 
         # --- Prompt ---
         tk.Label(self, text="Prompt:", anchor="nw").grid(row=5, column=0, sticky="nw", **pad)
@@ -251,6 +285,8 @@ class App(tk.Tk):
         output_dir = Path(self.output_var.get().strip())
         prompt = self.prompt_text.get("1.0", "end").strip()
         model = self.model_var.get().strip()
+        aspect_ratio = self.aspect_ratio_var.get()
+        image_size = self.image_size_var.get()
 
         if not api_key:
             self._log("ERROR: API key is required.")
@@ -273,7 +309,7 @@ class App(tk.Tk):
         thread = threading.Thread(
             target=self._run_worker,
             args=(api_key, model, prompt, input_dir, output_dir,
-                  self.overwrite_var.get()),
+                  self.overwrite_var.get(), aspect_ratio, image_size),
             daemon=True,
         )
         thread.start()
@@ -298,7 +334,8 @@ class App(tk.Tk):
     # Worker (runs in a background thread)
     # ------------------------------------------------------------------
 
-    def _run_worker(self, api_key, model, prompt, input_dir, output_dir, overwrite):
+    def _run_worker(self, api_key, model, prompt, input_dir, output_dir, overwrite,
+                    aspect_ratio, image_size):
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
@@ -309,7 +346,8 @@ class App(tk.Tk):
         images = collect_images(input_dir)
         total = len(images)
         self.after(0, self._log, f"Found {total} image(s) in {input_dir}")
-        self.after(0, self._log, f"Model: {model}\n")
+        self.after(0, self._log,
+                   f"Model: {model}  |  Aspect ratio: {aspect_ratio}  |  Resolution: {image_size}\n")
 
         if total == 0:
             self.after(0, self._finish, 0, 0, 0, output_dir)
@@ -339,7 +377,8 @@ class App(tk.Tk):
             attempt = 0
             while attempt < MAX_RETRIES:
                 try:
-                    ok = process_image(client, model, prompt, image_path, output_path)
+                    ok = process_image(client, model, prompt, image_path, output_path,
+                                      aspect_ratio, image_size)
                     if ok:
                         self.after(0, self._log,
                                    f"          saved → {output_path.name}")

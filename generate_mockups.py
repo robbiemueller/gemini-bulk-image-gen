@@ -218,6 +218,37 @@ def keychain_delete_api_key() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Saved prompts  (prompts.json — gitignored, never committed)
+# Stored as an ordered list of {"name": str, "text": str} objects so the
+# display order is preserved across sessions.
+# ---------------------------------------------------------------------------
+
+PROMPTS_FILE = SCRIPT_DIR / "prompts.json"
+
+
+def load_prompts() -> list[dict]:
+    """Return saved prompts as [{"name": ..., "text": ...}, ...], or []."""
+    try:
+        if PROMPTS_FILE.exists():
+            with PROMPTS_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+
+def save_prompts(prompts: list[dict]) -> None:
+    """Write prompts list to prompts.json, silently ignore errors."""
+    try:
+        with PROMPTS_FILE.open("w", encoding="utf-8") as f:
+            json.dump(prompts, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 
@@ -226,8 +257,11 @@ class App(tk.Tk):
         super().__init__()
         self.title("Gemini Bulk Image Generator")
         self.resizable(True, True)
+        self.geometry("780x700")
+        self.minsize(620, 520)
         self._stop_event = threading.Event()
         self._config = load_config()
+        self._prompts: list[dict] = load_prompts()   # [{"name":..., "text":...}]
         self._build_ui()
         self._load_state()
 
@@ -299,9 +333,32 @@ class App(tk.Tk):
 
         # --- Prompt ---
         tk.Label(self, text="Prompt:", anchor="nw").grid(row=5, column=0, sticky="nw", **pad)
-        self.prompt_text = scrolledtext.ScrolledText(self, width=60, height=6, wrap=tk.WORD)
+
+        prompt_col = tk.Frame(self)
+        prompt_col.grid(row=5, column=1, columnspan=2, sticky="nsew", **pad)
+        prompt_col.columnconfigure(0, weight=1)
+
+        # Toolbar: saved-prompt picker + Save + Delete
+        prompt_toolbar = tk.Frame(prompt_col)
+        prompt_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        prompt_toolbar.columnconfigure(0, weight=1)
+
+        self._saved_prompt_var = tk.StringVar()
+        self._prompt_combo = ttk.Combobox(prompt_toolbar, textvariable=self._saved_prompt_var,
+                                          state="readonly", width=38)
+        self._prompt_combo.grid(row=0, column=0, sticky="ew")
+        self._prompt_combo.bind("<<ComboboxSelected>>", self._on_prompt_selected)
+
+        tk.Button(prompt_toolbar, text="💾 Save", width=8,
+                  command=self._save_prompt).grid(row=0, column=1, padx=(6, 0))
+        tk.Button(prompt_toolbar, text="🗑 Delete", width=8,
+                  command=self._delete_prompt).grid(row=0, column=2, padx=(4, 0))
+
+        # Text area
+        self.prompt_text = scrolledtext.ScrolledText(prompt_col, width=60, height=4, wrap=tk.WORD)
         self.prompt_text.insert("1.0", DEFAULT_PROMPT)
-        self.prompt_text.grid(row=5, column=1, columnspan=2, sticky="ew", **pad)
+        self.prompt_text.grid(row=1, column=0, sticky="nsew")
+        prompt_col.rowconfigure(1, weight=1)
 
         # --- Progress ---
         self.progress_var = tk.DoubleVar(value=0)
@@ -313,7 +370,7 @@ class App(tk.Tk):
         self.status_label.grid(row=7, column=0, columnspan=3, sticky="w", **pad)
 
         # --- Log ---
-        self.log = scrolledtext.ScrolledText(self, width=70, height=12, state="disabled",
+        self.log = scrolledtext.ScrolledText(self, width=70, height=8, state="disabled",
                                              wrap=tk.WORD, bg="#1e1e1e", fg="#d4d4d4",
                                              font=("TkFixedFont", 9))
         self.log.grid(row=8, column=0, columnspan=3, sticky="nsew", **pad)
@@ -342,9 +399,12 @@ class App(tk.Tk):
                                    state="disabled", command=self._request_stop)
         self.stop_btn.pack(side="left", padx=6)
 
-        # Make columns/rows resize gracefully
+        # Make columns/rows resize gracefully.
+        # Row 5 (prompt) and row 8 (log) both grow on vertical resize;
+        # weight=2 on the log gives it twice the extra space vs the prompt.
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(8, weight=1)
+        self.rowconfigure(5, weight=1)
+        self.rowconfigure(8, weight=2)
 
         # Disable "Save API key" if keyring is not installed
         if not _KEYRING_AVAILABLE:
@@ -365,6 +425,118 @@ class App(tk.Tk):
         folder = filedialog.askdirectory(title="Select output folder")
         if folder:
             self.output_var.set(folder)
+
+    # ------------------------------------------------------------------
+    # Saved prompts
+    # ------------------------------------------------------------------
+
+    def _refresh_prompt_combo(self):
+        """Sync the combobox values with self._prompts."""
+        names = [p["name"] for p in self._prompts]
+        self._prompt_combo["values"] = names
+        # Keep selection in sync if the current name still exists
+        if self._saved_prompt_var.get() not in names:
+            self._saved_prompt_var.set("")
+
+    def _on_prompt_selected(self, _event=None):
+        """Load the selected saved prompt into the text area."""
+        name = self._saved_prompt_var.get()
+        for p in self._prompts:
+            if p["name"] == name:
+                self.prompt_text.delete("1.0", "end")
+                self.prompt_text.insert("1.0", p["text"])
+                break
+
+    def _save_prompt(self):
+        """Ask for a name and save the current prompt text."""
+        current_text = self.prompt_text.get("1.0", "end").strip()
+        if not current_text:
+            return
+
+        # Build a simple name-entry dialog
+        dlg = tk.Toplevel(self)
+        dlg.title("Save Prompt")
+        dlg.resizable(False, False)
+        dlg.grab_set()                      # modal
+        dlg.transient(self)
+
+        tk.Label(dlg, text="Name for this prompt:").pack(padx=16, pady=(14, 4))
+        name_var = tk.StringVar()
+
+        # Pre-fill with the current selection if it exists (easy overwrite)
+        if self._saved_prompt_var.get():
+            name_var.set(self._saved_prompt_var.get())
+
+        name_entry = tk.Entry(dlg, textvariable=name_var, width=36)
+        name_entry.pack(padx=16)
+        name_entry.select_range(0, "end")
+        name_entry.focus_set()
+
+        def _confirm():
+            name = name_var.get().strip()
+            if not name:
+                return
+            # Overwrite if name already exists, otherwise append
+            for p in self._prompts:
+                if p["name"] == name:
+                    p["text"] = current_text
+                    break
+            else:
+                self._prompts.append({"name": name, "text": current_text})
+            save_prompts(self._prompts)
+            self._refresh_prompt_combo()
+            self._saved_prompt_var.set(name)
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg)
+        btn_row.pack(pady=12)
+        tk.Button(btn_row, text="Save", width=10, command=_confirm).pack(side="left", padx=6)
+        tk.Button(btn_row, text="Cancel", width=10, command=dlg.destroy).pack(side="left", padx=6)
+
+        # Allow Enter to confirm
+        dlg.bind("<Return>", lambda _e: _confirm())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+
+        # Centre the dialog over the main window
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_reqheight()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+    def _delete_prompt(self):
+        """Delete the currently selected saved prompt after confirmation."""
+        name = self._saved_prompt_var.get()
+        if not name:
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Delete Prompt")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self)
+
+        tk.Label(dlg, text=f'Delete "{name}"?').pack(padx=20, pady=(16, 4))
+        tk.Label(dlg, text="This cannot be undone.", fg="gray",
+                 font=("TkDefaultFont", 8)).pack(padx=20, pady=(0, 12))
+
+        def _confirm():
+            self._prompts = [p for p in self._prompts if p["name"] != name]
+            save_prompts(self._prompts)
+            self._refresh_prompt_combo()
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg)
+        btn_row.pack(pady=(0, 12))
+        tk.Button(btn_row, text="Delete", width=10, command=_confirm).pack(side="left", padx=6)
+        tk.Button(btn_row, text="Cancel", width=10, command=dlg.destroy).pack(side="left", padx=6)
+
+        dlg.bind("<Return>", lambda _e: _confirm())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_reqheight()) // 2
+        dlg.geometry(f"+{x}+{y}")
 
     # ------------------------------------------------------------------
     # Config persistence
@@ -399,6 +571,9 @@ class App(tk.Tk):
             self.after(200, self._log,
                        "NOTE: 'keyring' package not found — "
                        "run 'pip install keyring' to enable secure API key saving.")
+
+        # Populate the saved-prompts combobox
+        self._refresh_prompt_combo()
 
     def _save_state(self):
         """Persist settings to config.json; API key goes to OS keychain only."""

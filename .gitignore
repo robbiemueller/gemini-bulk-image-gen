@@ -20,8 +20,9 @@ ENV/
 .env.*
 *.env
 
-# Local user config
+# Local user config and saved prompts (personal, never commit)
 config.json
+prompts.json
 
 # Generated output images (don't accidentally commit API results)
 output/

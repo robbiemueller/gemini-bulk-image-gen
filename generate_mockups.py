@@ -53,11 +53,15 @@ IMAGE_SIZES = ["1K", "2K", "4K"]
 DEFAULT_IMAGE_SIZE = "1K"
 
 DEFAULT_PROMPT = (
-    "take the print from this image and create a square aspect ratio hero mockup photo "
-    "of 3 of these prints inside of different landscape orientation colored oak frames. "
-    "one should be a walnut oak frame, the other should be a natural wood oak frame, and "
-    "the 3rd should be a bright white oak frame. the frames should be overlapping each "
-    "other sitting on a wood floor leaning against a neutral colored wall"
+    "Create a high-resolution, photorealistic interior product mockup featuring the provided artwork. "
+    "The artwork is displayed identically inside three landscape-oriented frames resting on a rustic, "
+    "wide-plank wood floor and leaning against a minimalistic, warm off-white wall with a subtle "
+    "baseboard. Arrange the frames in a staggered, overlapping line from left to right: the leftmost "
+    "frame is dark walnut wood (positioned furthest back), the center frame is natural light oak wood "
+    "(slightly overlapping the left frame), and the rightmost frame is bright white wood (positioned "
+    "at the front, slightly overlapping the center frame). Use soft, natural window lighting from the "
+    "side to cast a realistic glass reflection and glare over the rightmost white frame. Warm, "
+    "inviting, mid-century modern interior photography style with a shallow depth of field."
 )
 
 MIME_MAP = {

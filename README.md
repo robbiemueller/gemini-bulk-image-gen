@@ -2,7 +2,7 @@
 
 A simple desktop GUI for batch-processing images through the [Google Gemini](https://ai.google.dev/) image-generation API. Point it at a folder of images, write a prompt, and it generates a new AI image for each one — saving the results to an output folder of your choice.
 
-Originally built to create product mockups from print designs, but works for any image transformation prompt.
+Originally built to create framed wall art product mockups from print designs (walnut, oak, and white wood frames in a mid-century modern interior), but works for any image transformation prompt.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)

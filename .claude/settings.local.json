@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "mcp__desktop-commander__list_directory"
-    ]
-  }
-}

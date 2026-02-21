@@ -18,6 +18,7 @@ Setup:
 """
 
 import io
+import json
 import os
 import re
 import sys
@@ -27,6 +28,13 @@ import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
 from pathlib import Path
 import platform
+
+try:
+    import keyring
+    import keyring.errors
+    _KEYRING_AVAILABLE = True
+except ImportError:
+    _KEYRING_AVAILABLE = False
 
 from google import genai
 from google.genai import types
@@ -146,6 +154,70 @@ class _RateLimitRetry(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Persistent config  (config.json — gitignored, never committed)
+# API key is stored in the OS keychain via `keyring`, never in config.json
+# ---------------------------------------------------------------------------
+
+CONFIG_FILE = SCRIPT_DIR / "config.json"
+
+_KEYCHAIN_SERVICE = "gemini-bulk-image-gen"
+_KEYCHAIN_USER    = "google_api_key"
+_SAVE_API_KEY     = "save_api_key"   # boolean flag stored in config.json
+
+
+def load_config() -> dict:
+    """Load config.json, return empty dict on any error."""
+    try:
+        if CONFIG_FILE.exists():
+            with CONFIG_FILE.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_config(data: dict) -> None:
+    """Write config.json (no secrets), silently ignore write errors."""
+    try:
+        with CONFIG_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def keychain_load_api_key() -> str:
+    """Return the API key from the OS keychain, or '' on any error."""
+    if not _KEYRING_AVAILABLE:
+        return ""
+    try:
+        return keyring.get_password(_KEYCHAIN_SERVICE, _KEYCHAIN_USER) or ""
+    except Exception:
+        return ""
+
+
+def keychain_save_api_key(api_key: str) -> None:
+    """Store the API key in the OS keychain, silently ignore errors."""
+    if not _KEYRING_AVAILABLE:
+        return
+    try:
+        keyring.set_password(_KEYCHAIN_SERVICE, _KEYCHAIN_USER, api_key)
+    except Exception:
+        pass
+
+
+def keychain_delete_api_key() -> None:
+    """Remove the API key from the OS keychain, silently ignore errors."""
+    if not _KEYRING_AVAILABLE:
+        return
+    try:
+        keyring.delete_password(_KEYCHAIN_SERVICE, _KEYCHAIN_USER)
+    except keyring.errors.PasswordDeleteError:
+        pass
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 
@@ -155,7 +227,9 @@ class App(tk.Tk):
         self.title("Gemini Bulk Image Generator")
         self.resizable(True, True)
         self._stop_event = threading.Event()
+        self._config = load_config()
         self._build_ui()
+        self._load_state()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -167,8 +241,14 @@ class App(tk.Tk):
         # --- API key ---
         tk.Label(self, text="API Key:", anchor="w").grid(row=0, column=0, sticky="w", **pad)
         self.api_key_var = tk.StringVar(value=os.environ.get("GOOGLE_API_KEY", ""))
-        api_entry = tk.Entry(self, textvariable=self.api_key_var, show="*", width=50)
-        api_entry.grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
+        api_row = tk.Frame(self)
+        api_row.grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
+        api_entry = tk.Entry(api_row, textvariable=self.api_key_var, show="*", width=44)
+        api_entry.pack(side="left")
+        self.save_api_key_var = tk.BooleanVar(value=False)
+        self._save_key_cb = tk.Checkbutton(api_row, text="Save API key",
+                                           variable=self.save_api_key_var)
+        self._save_key_cb.pack(side="left", padx=(10, 0))
 
         # --- Model ---
         tk.Label(self, text="Model:", anchor="w").grid(row=1, column=0, sticky="w", **pad)
@@ -239,21 +319,36 @@ class App(tk.Tk):
         self.log.grid(row=8, column=0, columnspan=3, sticky="nsew", **pad)
 
         # --- Buttons ---
-        # ttk.Button respects native theming on all platforms (tk.Button ignores bg/fg on macOS)
+        # Native ttk themes (vista, aqua) ignore fg/bg on buttons.
+        # "clam" is a built-in cross-platform theme that honours colours;
+        # we scope it to a named style so all other widgets keep their OS look.
         btn_frame = tk.Frame(self)
         btn_frame.grid(row=9, column=0, columnspan=3, pady=10)
         style = ttk.Style()
-        style.configure("Run.TButton", foreground="white", background="#0078d7")
+        style.theme_use("clam")
+        style.configure("Run.TButton",
+                        foreground="white", background="#0078d7",
+                        font=("TkDefaultFont", 10, "bold"),
+                        padding=6)
+        style.map("Run.TButton",
+                  background=[("active", "#005fa3"), ("disabled", "#a0a0a0")],
+                  foreground=[("disabled", "#d0d0d0")])
+        style.configure("Stop.TButton", padding=6)
         self.run_btn = ttk.Button(btn_frame, text="Run", width=14,
                                   style="Run.TButton", command=self._start)
         self.run_btn.pack(side="left", padx=6)
         self.stop_btn = ttk.Button(btn_frame, text="Stop", width=14,
+                                   style="Stop.TButton",
                                    state="disabled", command=self._request_stop)
         self.stop_btn.pack(side="left", padx=6)
 
         # Make columns/rows resize gracefully
         self.columnconfigure(1, weight=1)
         self.rowconfigure(8, weight=1)
+
+        # Disable "Save API key" if keyring is not installed
+        if not _KEYRING_AVAILABLE:
+            self._save_key_cb.configure(state="disabled")
 
     # ------------------------------------------------------------------
     # Folder pickers
@@ -270,6 +365,61 @@ class App(tk.Tk):
         folder = filedialog.askdirectory(title="Select output folder")
         if folder:
             self.output_var.set(folder)
+
+    # ------------------------------------------------------------------
+    # Config persistence
+    # ------------------------------------------------------------------
+
+    def _load_state(self):
+        """Populate widgets from saved config and OS keychain."""
+        c = self._config
+
+        # API key priority: env var > OS keychain (if opted in) > empty
+        if c.get(_SAVE_API_KEY):
+            self.save_api_key_var.set(True)
+            if not self.api_key_var.get():          # env var already fills this
+                self.api_key_var.set(keychain_load_api_key())
+
+        if c.get("input_dir"):
+            self.input_var.set(c["input_dir"])
+        if c.get("output_dir"):
+            self.output_var.set(c["output_dir"])
+        if c.get("model"):
+            self.model_var.set(c["model"])
+        if c.get("aspect_ratio") in ASPECT_RATIOS:
+            self.aspect_ratio_var.set(c["aspect_ratio"])
+        if c.get("image_size") in IMAGE_SIZES:
+            self.image_size_var.set(c["image_size"])
+        if "overwrite" in c:
+            self.overwrite_var.set(c["overwrite"])
+
+        if not _KEYRING_AVAILABLE:
+            self.save_api_key_var.set(False)
+            # Defer the log message until after mainloop starts
+            self.after(200, self._log,
+                       "NOTE: 'keyring' package not found — "
+                       "run 'pip install keyring' to enable secure API key saving.")
+
+    def _save_state(self):
+        """Persist settings to config.json; API key goes to OS keychain only."""
+        save_api = self.save_api_key_var.get()
+
+        # Handle keychain write / delete
+        if save_api:
+            keychain_save_api_key(self.api_key_var.get())
+        else:
+            keychain_delete_api_key()
+
+        # config.json stores everything EXCEPT the API key
+        save_config({
+            "input_dir":    self.input_var.get(),
+            "output_dir":   self.output_var.get(),
+            "model":        self.model_var.get(),
+            "aspect_ratio": self.aspect_ratio_var.get(),
+            "image_size":   self.image_size_var.get(),
+            "overwrite":    self.overwrite_var.get(),
+            _SAVE_API_KEY:  save_api,
+        })
 
     # ------------------------------------------------------------------
     # Logging
@@ -310,6 +460,7 @@ class App(tk.Tk):
             self._log("ERROR: Prompt cannot be empty.")
             return
 
+        self._save_state()
         self._stop_event.clear()
         self.run_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -428,6 +579,7 @@ class App(tk.Tk):
 
 def main():
     app = App()
+    app.protocol("WM_DELETE_WINDOW", lambda: (app._save_state(), app.destroy()))
     app.mainloop()
 
 

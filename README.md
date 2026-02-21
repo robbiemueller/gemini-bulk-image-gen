@@ -15,6 +15,8 @@ Originally built to create framed wall art product mockups from print designs (w
 - Write any prompt — or use the built-in default
 - Choose model, aspect ratio, and output resolution
 - Progress bar and real-time log
+- Remembers your folders and settings between sessions
+- Optional secure API key saving via the OS keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service) — never stored in plaintext
 - Skips already-processed images (with optional overwrite)
 - Handles rate limits automatically with retries
 
@@ -47,7 +49,7 @@ export GOOGLE_API_KEY="your_key_here"
 $env:GOOGLE_API_KEY = "your_key_here"
 ```
 
-You can also paste the key directly into the API Key field in the GUI.
+You can also paste the key directly into the **API Key** field in the GUI. Check **Save API key** to store it securely in your OS keychain so you don't need to re-enter it each time — it is never written to disk in plaintext.
 
 ## Usage
 

@@ -20,12 +20,14 @@ Everything lives in one file — no package structure, no modules. Keep it that 
 - **`ttk` widgets for buttons** — `tk.Button` ignores `bg`/`fg` on macOS; use `ttk.Button` instead
 - **`TkFixedFont`** for the log widget — cross-platform monospace; don't hardcode `Consolas` or `Menlo`
 - **API key** — read from `GOOGLE_API_KEY` env var or the GUI field; never log or print it
+- **Keychain** — when "Save API key" is checked, the key is stored via `keyring` (Windows Credential Manager / macOS Keychain / Linux Secret Service); it is **never** written to `config.json` or any file on disk
 
 ## Dependencies
 
 ```
 google-genai>=1.0.0
 Pillow>=10.0.0
+keyring>=24.0.0
 tkinter  # stdlib, no install needed
 ```
 

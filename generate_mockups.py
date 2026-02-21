@@ -10,8 +10,9 @@ Requirements:
 
 Setup:
     1. Enable billing: https://aistudio.google.com/plan_information
-    2. Set your API key in PowerShell:
-           $env:GOOGLE_API_KEY = "your_key_here"
+    2. Set your API key:
+           Windows (PowerShell): $env:GOOGLE_API_KEY = "your_key_here"
+           macOS/Linux:          export GOOGLE_API_KEY="your_key_here"
     3. Run:
            python generate_mockups.py
 """
@@ -25,6 +26,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
 from pathlib import Path
+import platform
 
 from google import genai
 from google.genai import types
@@ -148,7 +150,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("Gemini Bulk Image Generator")
         self.resizable(True, True)
-        self._running = False
+        self._stop_event = threading.Event()
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -229,17 +231,20 @@ class App(tk.Tk):
         # --- Log ---
         self.log = scrolledtext.ScrolledText(self, width=70, height=12, state="disabled",
                                              wrap=tk.WORD, bg="#1e1e1e", fg="#d4d4d4",
-                                             font=("Consolas", 9))
+                                             font=("TkFixedFont", 9))
         self.log.grid(row=8, column=0, columnspan=3, sticky="nsew", **pad)
 
         # --- Buttons ---
+        # ttk.Button respects native theming on all platforms (tk.Button ignores bg/fg on macOS)
         btn_frame = tk.Frame(self)
         btn_frame.grid(row=9, column=0, columnspan=3, pady=10)
-        self.run_btn = tk.Button(btn_frame, text="Run", width=14,
-                                 bg="#0078d7", fg="white", command=self._start)
+        style = ttk.Style()
+        style.configure("Run.TButton", foreground="white", background="#0078d7")
+        self.run_btn = ttk.Button(btn_frame, text="Run", width=14,
+                                  style="Run.TButton", command=self._start)
         self.run_btn.pack(side="left", padx=6)
-        self.stop_btn = tk.Button(btn_frame, text="Stop", width=14,
-                                  state="disabled", command=self._request_stop)
+        self.stop_btn = ttk.Button(btn_frame, text="Stop", width=14,
+                                   state="disabled", command=self._request_stop)
         self.stop_btn.pack(side="left", padx=6)
 
         # Make columns/rows resize gracefully
@@ -301,7 +306,7 @@ class App(tk.Tk):
             self._log("ERROR: Prompt cannot be empty.")
             return
 
-        self._running = True
+        self._stop_event.clear()
         self.run_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress_var.set(0)
@@ -315,7 +320,7 @@ class App(tk.Tk):
         thread.start()
 
     def _request_stop(self):
-        self._running = False
+        self._stop_event.set()
         self._set_status("Stopping after current image…", "orange")
 
     def _finish(self, succeeded: int, skipped: int, failed: int, output_dir: Path):
@@ -357,7 +362,7 @@ class App(tk.Tk):
         succeeded = skipped = failed = 0
 
         for idx, image_path in enumerate(images, start=1):
-            if not self._running:
+            if self._stop_event.is_set():
                 break
 
             output_path = output_dir / f"{image_path.stem}_mockup.png"
@@ -396,7 +401,7 @@ class App(tk.Tk):
                                f"(retry {rl.attempt}/{MAX_RETRIES-1})…")
                     # Sleep in small increments so Stop works promptly
                     for _ in range(rl.wait):
-                        if not self._running:
+                        if self._stop_event.is_set():
                             break
                         time.sleep(1)
 
@@ -407,7 +412,7 @@ class App(tk.Tk):
 
             self.after(0, self.progress_var.set, idx / total * 100)
 
-            if self._running and idx < total:
+            if not self._stop_event.is_set() and idx < total:
                 time.sleep(REQUEST_DELAY)
 
         self.after(0, self._finish, succeeded, skipped, failed, output_dir)

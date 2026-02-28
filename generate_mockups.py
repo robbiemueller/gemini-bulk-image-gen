@@ -25,7 +25,7 @@ import sys
 import time
 import threading
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 from pathlib import Path
 import platform
 
@@ -88,6 +88,9 @@ REQUEST_DELAY = 5
 # Retry settings for rate-limit (429) errors
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 60
+
+# Sentinel value for the prompt-set dropdown
+_SINGLE_PROMPT = "-- Single prompt --"
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +252,36 @@ def save_prompts(prompts: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Prompt sets  (prompt_sets.json — gitignored, never committed)
+# Each set is {"name": str, "prompts": [{"name": str, "text": str}, ...]}
+# ---------------------------------------------------------------------------
+
+PROMPT_SETS_FILE = SCRIPT_DIR / "prompt_sets.json"
+
+
+def load_prompt_sets() -> list[dict]:
+    """Return saved prompt sets, or []."""
+    try:
+        if PROMPT_SETS_FILE.exists():
+            with PROMPT_SETS_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+
+def save_prompt_sets(sets: list[dict]) -> None:
+    """Write prompt sets to prompt_sets.json, silently ignore errors."""
+    try:
+        with PROMPT_SETS_FILE.open("w", encoding="utf-8") as f:
+            json.dump(sets, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 
@@ -257,11 +290,12 @@ class App(tk.Tk):
         super().__init__()
         self.title("Gemini Bulk Image Generator")
         self.resizable(True, True)
-        self.geometry("780x700")
-        self.minsize(620, 520)
+        self.geometry("880x800")
+        self.minsize(700, 580)
         self._stop_event = threading.Event()
         self._config = load_config()
-        self._prompts: list[dict] = load_prompts()   # [{"name":..., "text":...}]
+        self._prompts: list[dict] = load_prompts()       # individual saved prompts
+        self._prompt_sets: list[dict] = load_prompt_sets()  # prompt sets
         self._build_ui()
         self._load_state()
 
@@ -331,11 +365,39 @@ class App(tk.Tk):
         tk.Label(options_frame, text="(4K: pro model only)", fg="gray",
                  font=("TkDefaultFont", 8)).pack(side="left", padx=(6, 0))
 
-        # --- Prompt ---
-        tk.Label(self, text="Prompt:", anchor="nw").grid(row=5, column=0, sticky="nw", **pad)
+        # --- Prompt Set selector (NEW) ---
+        tk.Label(self, text="Prompt set:", anchor="w").grid(row=5, column=0, sticky="w", **pad)
+
+        set_col = tk.Frame(self)
+        set_col.grid(row=5, column=1, columnspan=2, sticky="ew", **pad)
+
+        self._prompt_set_var = tk.StringVar(value=_SINGLE_PROMPT)
+        self._prompt_set_combo = ttk.Combobox(set_col, textvariable=self._prompt_set_var,
+                                              state="readonly", width=34)
+        self._prompt_set_combo.pack(side="left")
+        self._prompt_set_combo.bind("<<ComboboxSelected>>", self._on_prompt_set_selected)
+
+        tk.Button(set_col, text="New Set…", command=self._new_prompt_set).pack(
+            side="left", padx=(8, 0))
+        tk.Button(set_col, text="Edit Set…", command=self._edit_prompt_set).pack(
+            side="left", padx=(4, 0))
+        tk.Button(set_col, text="Delete Set", command=self._delete_prompt_set).pack(
+            side="left", padx=(4, 0))
+
+        # Info label showing set contents
+        self._set_info_var = tk.StringVar(value="")
+        self._set_info_label = tk.Label(self, textvariable=self._set_info_var,
+                                        anchor="w", fg="gray",
+                                        font=("TkDefaultFont", 8), wraplength=600,
+                                        justify="left")
+        self._set_info_label.grid(row=6, column=1, columnspan=2, sticky="w",
+                                  padx=10, pady=(0, 2))
+
+        # --- Prompt (single-prompt editor) ---
+        tk.Label(self, text="Prompt:", anchor="nw").grid(row=7, column=0, sticky="nw", **pad)
 
         prompt_col = tk.Frame(self)
-        prompt_col.grid(row=5, column=1, columnspan=2, sticky="nsew", **pad)
+        prompt_col.grid(row=7, column=1, columnspan=2, sticky="nsew", **pad)
         prompt_col.columnconfigure(0, weight=1)
 
         # Toolbar: saved-prompt picker + Save + Delete
@@ -364,23 +426,23 @@ class App(tk.Tk):
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_bar = ttk.Progressbar(
             self, variable=self.progress_var, maximum=100, length=400)
-        self.progress_bar.grid(row=6, column=0, columnspan=3, sticky="ew", **pad)
+        self.progress_bar.grid(row=8, column=0, columnspan=3, sticky="ew", **pad)
 
         self.status_label = tk.Label(self, text="", anchor="w", fg="gray")
-        self.status_label.grid(row=7, column=0, columnspan=3, sticky="w", **pad)
+        self.status_label.grid(row=9, column=0, columnspan=3, sticky="w", **pad)
 
         # --- Log ---
         self.log = scrolledtext.ScrolledText(self, width=70, height=8, state="disabled",
                                              wrap=tk.WORD, bg="#1e1e1e", fg="#d4d4d4",
                                              font=("TkFixedFont", 9))
-        self.log.grid(row=8, column=0, columnspan=3, sticky="nsew", **pad)
+        self.log.grid(row=10, column=0, columnspan=3, sticky="nsew", **pad)
 
         # --- Buttons ---
         # Native ttk themes (vista, aqua) ignore fg/bg on buttons.
         # "clam" is a built-in cross-platform theme that honours colours;
         # we scope it to a named style so all other widgets keep their OS look.
         btn_frame = tk.Frame(self)
-        btn_frame.grid(row=9, column=0, columnspan=3, pady=10)
+        btn_frame.grid(row=11, column=0, columnspan=3, pady=10)
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Run.TButton",
@@ -400,11 +462,9 @@ class App(tk.Tk):
         self.stop_btn.pack(side="left", padx=6)
 
         # Make columns/rows resize gracefully.
-        # Row 5 (prompt) and row 8 (log) both grow on vertical resize;
-        # weight=2 on the log gives it twice the extra space vs the prompt.
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(5, weight=1)
-        self.rowconfigure(8, weight=2)
+        self.rowconfigure(7, weight=1)    # prompt editor
+        self.rowconfigure(10, weight=2)   # log
 
         # Disable "Save API key" if keyring is not installed
         if not _KEYRING_AVAILABLE:
@@ -427,14 +487,299 @@ class App(tk.Tk):
             self.output_var.set(folder)
 
     # ------------------------------------------------------------------
-    # Saved prompts
+    # Prompt set management
+    # ------------------------------------------------------------------
+
+    def _refresh_prompt_set_combo(self):
+        """Sync the prompt-set combobox with self._prompt_sets."""
+        names = [_SINGLE_PROMPT] + [s["name"] for s in self._prompt_sets]
+        self._prompt_set_combo["values"] = names
+        if self._prompt_set_var.get() not in names:
+            self._prompt_set_var.set(_SINGLE_PROMPT)
+        self._update_set_info()
+
+    def _update_set_info(self):
+        """Update the info label below the prompt-set selector."""
+        name = self._prompt_set_var.get()
+        if name == _SINGLE_PROMPT:
+            self._set_info_var.set("Using the single prompt editor below.")
+            return
+        for s in self._prompt_sets:
+            if s["name"] == name:
+                prompts = s.get("prompts", [])
+                n = len(prompts)
+                if n == 0:
+                    self._set_info_var.set("Set is empty — add prompts via Edit Set.")
+                else:
+                    preview = ", ".join(p["name"] for p in prompts[:8])
+                    if n > 8:
+                        preview += f", … ({n} total)"
+                    self._set_info_var.set(f"{n} prompt(s): {preview}")
+                return
+        self._set_info_var.set("")
+
+    def _on_prompt_set_selected(self, _event=None):
+        self._update_set_info()
+
+    def _new_prompt_set(self):
+        """Open the set editor dialog to create a new prompt set."""
+        self._open_set_editor(None)
+
+    def _edit_prompt_set(self):
+        """Open the set editor dialog for the currently selected set."""
+        name = self._prompt_set_var.get()
+        if name == _SINGLE_PROMPT:
+            self._log("Select a prompt set first, or click 'New Set…' to create one.")
+            return
+        for s in self._prompt_sets:
+            if s["name"] == name:
+                self._open_set_editor(s)
+                return
+
+    def _delete_prompt_set(self):
+        """Delete the currently selected prompt set after confirmation."""
+        name = self._prompt_set_var.get()
+        if name == _SINGLE_PROMPT:
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Delete Prompt Set")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self)
+
+        tk.Label(dlg, text=f'Delete set "{name}"?').pack(padx=20, pady=(16, 4))
+        tk.Label(dlg, text="This cannot be undone.", fg="gray",
+                 font=("TkDefaultFont", 8)).pack(padx=20, pady=(0, 12))
+
+        def _confirm():
+            self._prompt_sets = [s for s in self._prompt_sets if s["name"] != name]
+            save_prompt_sets(self._prompt_sets)
+            self._prompt_set_var.set(_SINGLE_PROMPT)
+            self._refresh_prompt_set_combo()
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg)
+        btn_row.pack(pady=(0, 12))
+        tk.Button(btn_row, text="Delete", width=10, command=_confirm).pack(side="left", padx=6)
+        tk.Button(btn_row, text="Cancel", width=10, command=dlg.destroy).pack(side="left", padx=6)
+
+        dlg.bind("<Return>", lambda _e: _confirm())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_reqheight()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+    # ------------------------------------------------------------------
+    # Prompt set editor dialog
+    # ------------------------------------------------------------------
+
+    def _open_set_editor(self, existing_set: dict | None):
+        """Open a dialog to create or edit a prompt set.
+
+        If *existing_set* is None a new empty set is created; otherwise the
+        existing set is edited in-place.
+        """
+        dlg = tk.Toplevel(self)
+        dlg.title("Edit Prompt Set" if existing_set else "New Prompt Set")
+        dlg.resizable(True, True)
+        dlg.geometry("720x480")
+        dlg.minsize(520, 350)
+        dlg.grab_set()
+        dlg.transient(self)
+
+        # Working copy of prompts (list of dicts)
+        if existing_set:
+            work_prompts: list[dict] = [dict(p) for p in existing_set.get("prompts", [])]
+        else:
+            work_prompts = []
+
+        # --- Set name ---
+        name_frame = tk.Frame(dlg)
+        name_frame.pack(fill="x", padx=12, pady=(12, 6))
+        tk.Label(name_frame, text="Set name:").pack(side="left")
+        set_name_var = tk.StringVar(value=existing_set["name"] if existing_set else "")
+        tk.Entry(name_frame, textvariable=set_name_var, width=40).pack(side="left", padx=(6, 0))
+
+        # --- Main pane: list + editor ---
+        pane = tk.Frame(dlg)
+        pane.pack(fill="both", expand=True, padx=12, pady=4)
+        pane.columnconfigure(1, weight=1)
+        pane.rowconfigure(0, weight=1)
+
+        # Left: prompt listbox
+        list_frame = tk.LabelFrame(pane, text="Prompts")
+        list_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        list_frame.rowconfigure(0, weight=1)
+
+        listbox = tk.Listbox(list_frame, width=24, exportselection=False)
+        listbox.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        list_sb = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        list_sb.grid(row=0, column=1, sticky="ns", pady=4)
+        listbox.configure(yscrollcommand=list_sb.set)
+
+        # Right: prompt text editor
+        edit_frame = tk.LabelFrame(pane, text="Prompt text")
+        edit_frame.grid(row=0, column=1, sticky="nsew")
+        edit_frame.rowconfigure(1, weight=1)
+        edit_frame.columnconfigure(0, weight=1)
+
+        # Prompt name field
+        pname_row = tk.Frame(edit_frame)
+        pname_row.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        tk.Label(pname_row, text="Name:").pack(side="left")
+        prompt_name_var = tk.StringVar()
+        prompt_name_entry = tk.Entry(pname_row, textvariable=prompt_name_var, width=30)
+        prompt_name_entry.pack(side="left", padx=(4, 0))
+
+        # Prompt text area
+        prompt_edit = scrolledtext.ScrolledText(edit_frame, width=40, height=8, wrap=tk.WORD)
+        prompt_edit.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+
+        # ---- Helper functions ----
+
+        def _refresh_listbox():
+            listbox.delete(0, "end")
+            for i, p in enumerate(work_prompts, 1):
+                listbox.insert("end", f"{i}. {p['name']}")
+
+        def _save_current_to_work():
+            """Save whatever is in the editor back to the work_prompts list."""
+            sel = listbox.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            work_prompts[idx]["name"] = prompt_name_var.get().strip() or f"Prompt {idx+1}"
+            work_prompts[idx]["text"] = prompt_edit.get("1.0", "end").strip()
+            # Refresh that row's display text
+            listbox.delete(idx)
+            listbox.insert(idx, f"{idx+1}. {work_prompts[idx]['name']}")
+            listbox.selection_set(idx)
+
+        def _on_listbox_select(_event=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            p = work_prompts[idx]
+            prompt_name_var.set(p["name"])
+            prompt_edit.delete("1.0", "end")
+            prompt_edit.insert("1.0", p["text"])
+
+        listbox.bind("<<ListboxSelect>>", _on_listbox_select)
+
+        def _add_prompt():
+            _save_current_to_work()
+            n = len(work_prompts) + 1
+            work_prompts.append({"name": f"Prompt {n}", "text": ""})
+            _refresh_listbox()
+            listbox.selection_clear(0, "end")
+            listbox.selection_set("end")
+            listbox.see("end")
+            _on_listbox_select()
+            prompt_name_entry.focus_set()
+            prompt_name_entry.select_range(0, "end")
+
+        def _remove_prompt():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            work_prompts.pop(idx)
+            _refresh_listbox()
+            if work_prompts:
+                new_idx = min(idx, len(work_prompts) - 1)
+                listbox.selection_set(new_idx)
+                _on_listbox_select()
+            else:
+                prompt_name_var.set("")
+                prompt_edit.delete("1.0", "end")
+
+        def _move_up():
+            sel = listbox.curselection()
+            if not sel or sel[0] == 0:
+                return
+            _save_current_to_work()
+            idx = sel[0]
+            work_prompts[idx - 1], work_prompts[idx] = work_prompts[idx], work_prompts[idx - 1]
+            _refresh_listbox()
+            listbox.selection_set(idx - 1)
+            listbox.see(idx - 1)
+
+        def _move_down():
+            sel = listbox.curselection()
+            if not sel or sel[0] >= len(work_prompts) - 1:
+                return
+            _save_current_to_work()
+            idx = sel[0]
+            work_prompts[idx + 1], work_prompts[idx] = work_prompts[idx], work_prompts[idx + 1]
+            _refresh_listbox()
+            listbox.selection_set(idx + 1)
+            listbox.see(idx + 1)
+
+        # --- Toolbar buttons ---
+        tb = tk.Frame(dlg)
+        tb.pack(fill="x", padx=12, pady=(4, 2))
+        tk.Button(tb, text="+ Add", command=_add_prompt).pack(side="left", padx=(0, 4))
+        tk.Button(tb, text="- Remove", command=_remove_prompt).pack(side="left", padx=(0, 4))
+        tk.Button(tb, text="↑ Up", command=_move_up).pack(side="left", padx=(0, 4))
+        tk.Button(tb, text="↓ Down", command=_move_down).pack(side="left")
+
+        # --- Save / Cancel ---
+        def _do_save():
+            sname = set_name_var.get().strip()
+            if not sname:
+                messagebox.showwarning("Name required",
+                                      "Please enter a name for this prompt set.",
+                                      parent=dlg)
+                return
+            _save_current_to_work()
+
+            if existing_set:
+                existing_set["name"] = sname
+                existing_set["prompts"] = work_prompts
+            else:
+                # Check for duplicate name
+                for s in self._prompt_sets:
+                    if s["name"] == sname:
+                        s["prompts"] = work_prompts
+                        break
+                else:
+                    self._prompt_sets.append({"name": sname, "prompts": work_prompts})
+
+            save_prompt_sets(self._prompt_sets)
+            self._refresh_prompt_set_combo()
+            self._prompt_set_var.set(sname)
+            self._update_set_info()
+            dlg.destroy()
+
+        bottom = tk.Frame(dlg)
+        bottom.pack(fill="x", padx=12, pady=(6, 12))
+        tk.Button(bottom, text="Save Set", width=12, command=_do_save).pack(side="right", padx=(6, 0))
+        tk.Button(bottom, text="Cancel", width=12, command=dlg.destroy).pack(side="right")
+
+        # Populate
+        _refresh_listbox()
+        if work_prompts:
+            listbox.selection_set(0)
+            _on_listbox_select()
+
+        # Centre the dialog
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - 720) // 2
+        y = self.winfo_y() + (self.winfo_height() - 480) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+    # ------------------------------------------------------------------
+    # Saved prompts (individual — existing feature)
     # ------------------------------------------------------------------
 
     def _refresh_prompt_combo(self):
         """Sync the combobox values with self._prompts."""
         names = [p["name"] for p in self._prompts]
         self._prompt_combo["values"] = names
-        # Keep selection in sync if the current name still exists
         if self._saved_prompt_var.get() not in names:
             self._saved_prompt_var.set("")
 
@@ -453,17 +798,15 @@ class App(tk.Tk):
         if not current_text:
             return
 
-        # Build a simple name-entry dialog
         dlg = tk.Toplevel(self)
         dlg.title("Save Prompt")
         dlg.resizable(False, False)
-        dlg.grab_set()                      # modal
+        dlg.grab_set()
         dlg.transient(self)
 
         tk.Label(dlg, text="Name for this prompt:").pack(padx=16, pady=(14, 4))
         name_var = tk.StringVar()
 
-        # Pre-fill with the current selection if it exists (easy overwrite)
         if self._saved_prompt_var.get():
             name_var.set(self._saved_prompt_var.get())
 
@@ -476,7 +819,6 @@ class App(tk.Tk):
             name = name_var.get().strip()
             if not name:
                 return
-            # Overwrite if name already exists, otherwise append
             for p in self._prompts:
                 if p["name"] == name:
                     p["text"] = current_text
@@ -493,11 +835,9 @@ class App(tk.Tk):
         tk.Button(btn_row, text="Save", width=10, command=_confirm).pack(side="left", padx=6)
         tk.Button(btn_row, text="Cancel", width=10, command=dlg.destroy).pack(side="left", padx=6)
 
-        # Allow Enter to confirm
         dlg.bind("<Return>", lambda _e: _confirm())
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
 
-        # Centre the dialog over the main window
         self.update_idletasks()
         x = self.winfo_x() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
         y = self.winfo_y() + (self.winfo_height() - dlg.winfo_reqheight()) // 2
@@ -549,7 +889,7 @@ class App(tk.Tk):
         # API key priority: env var > OS keychain (if opted in) > empty
         if c.get(_SAVE_API_KEY):
             self.save_api_key_var.set(True)
-            if not self.api_key_var.get():          # env var already fills this
+            if not self.api_key_var.get():
                 self.api_key_var.set(keychain_load_api_key())
 
         if c.get("input_dir"):
@@ -567,7 +907,6 @@ class App(tk.Tk):
 
         if not _KEYRING_AVAILABLE:
             self.save_api_key_var.set(False)
-            # Defer the log message until after mainloop starts
             self.after(200, self._log,
                        "NOTE: 'keyring' package not found — "
                        "run 'pip install keyring' to enable secure API key saving.")
@@ -575,25 +914,34 @@ class App(tk.Tk):
         # Populate the saved-prompts combobox
         self._refresh_prompt_combo()
 
+        # Populate the prompt-set combobox and restore selection
+        self._refresh_prompt_set_combo()
+        saved_set = c.get("selected_prompt_set", _SINGLE_PROMPT)
+        set_names = [s["name"] for s in self._prompt_sets]
+        if saved_set in set_names:
+            self._prompt_set_var.set(saved_set)
+        else:
+            self._prompt_set_var.set(_SINGLE_PROMPT)
+        self._update_set_info()
+
     def _save_state(self):
         """Persist settings to config.json; API key goes to OS keychain only."""
         save_api = self.save_api_key_var.get()
 
-        # Handle keychain write / delete
         if save_api:
             keychain_save_api_key(self.api_key_var.get())
         else:
             keychain_delete_api_key()
 
-        # config.json stores everything EXCEPT the API key
         save_config({
-            "input_dir":    self.input_var.get(),
-            "output_dir":   self.output_var.get(),
-            "model":        self.model_var.get(),
-            "aspect_ratio": self.aspect_ratio_var.get(),
-            "image_size":   self.image_size_var.get(),
-            "overwrite":    self.overwrite_var.get(),
-            _SAVE_API_KEY:  save_api,
+            "input_dir":            self.input_var.get(),
+            "output_dir":           self.output_var.get(),
+            "model":                self.model_var.get(),
+            "aspect_ratio":         self.aspect_ratio_var.get(),
+            "image_size":           self.image_size_var.get(),
+            "overwrite":            self.overwrite_var.get(),
+            _SAVE_API_KEY:          save_api,
+            "selected_prompt_set":  self._prompt_set_var.get(),
         })
 
     # ------------------------------------------------------------------
@@ -617,7 +965,6 @@ class App(tk.Tk):
         api_key = self.api_key_var.get().strip()
         input_dir = Path(self.input_var.get().strip())
         output_dir = Path(self.output_var.get().strip())
-        prompt = self.prompt_text.get("1.0", "end").strip()
         model = self.model_var.get().strip()
         aspect_ratio = self.aspect_ratio_var.get()
         image_size = self.image_size_var.get()
@@ -631,9 +978,31 @@ class App(tk.Tk):
         if not output_dir:
             self._log("ERROR: Select an output folder.")
             return
-        if not prompt:
-            self._log("ERROR: Prompt cannot be empty.")
-            return
+
+        # Build prompt list: [(suffix, text), ...]
+        selected_set = self._prompt_set_var.get()
+        if selected_set != _SINGLE_PROMPT:
+            # Find the set
+            prompt_set = None
+            for s in self._prompt_sets:
+                if s["name"] == selected_set:
+                    prompt_set = s
+                    break
+            if not prompt_set or not prompt_set.get("prompts"):
+                self._log("ERROR: Selected prompt set is empty. Add prompts via Edit Set.")
+                return
+            prompts = [
+                (str(i), p["text"])
+                for i, p in enumerate(prompt_set["prompts"], 1)
+            ]
+            self._log(f'Using prompt set "{selected_set}" ({len(prompts)} prompts)')
+        else:
+            # Single prompt from text area
+            prompt_text = self.prompt_text.get("1.0", "end").strip()
+            if not prompt_text:
+                self._log("ERROR: Prompt cannot be empty.")
+                return
+            prompts = [("mockup", prompt_text)]
 
         self._save_state()
         self._stop_event.clear()
@@ -643,7 +1012,7 @@ class App(tk.Tk):
 
         thread = threading.Thread(
             target=self._run_worker,
-            args=(api_key, model, prompt, input_dir, output_dir,
+            args=(api_key, model, prompts, input_dir, output_dir,
                   self.overwrite_var.get(), aspect_ratio, image_size),
             daemon=True,
         )
@@ -669,8 +1038,13 @@ class App(tk.Tk):
     # Worker (runs in a background thread)
     # ------------------------------------------------------------------
 
-    def _run_worker(self, api_key, model, prompt, input_dir, output_dir, overwrite,
+    def _run_worker(self, api_key, model, prompts, input_dir, output_dir, overwrite,
                     aspect_ratio, image_size):
+        """Process images through one or more prompts.
+
+        *prompts* is a list of (suffix, prompt_text) tuples.
+        Output files are named {stem}_{suffix}.png.
+        """
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
@@ -679,71 +1053,90 @@ class App(tk.Tk):
             return
 
         images = collect_images(input_dir)
-        total = len(images)
-        self.after(0, self._log, f"Found {total} image(s) in {input_dir}")
-        self.after(0, self._log,
-                   f"Model: {model}  |  Aspect ratio: {aspect_ratio}  |  Resolution: {image_size}\n")
+        total_images = len(images)
+        total_prompts = len(prompts)
+        total_work = total_images * total_prompts
 
-        if total == 0:
+        self.after(0, self._log, f"Found {total_images} image(s) in {input_dir}")
+        self.after(0, self._log,
+                   f"Model: {model}  |  Aspect ratio: {aspect_ratio}  |  Resolution: {image_size}")
+        if total_prompts > 1:
+            self.after(0, self._log, f"Running {total_prompts} prompts per image "
+                                     f"({total_work} total generations)\n")
+        else:
+            self.after(0, self._log, "")
+
+        if total_images == 0:
             self.after(0, self._finish, 0, 0, 0, output_dir)
             return
 
         client = genai.Client(api_key=api_key)
         succeeded = skipped = failed = 0
+        completed = 0
 
-        for idx, image_path in enumerate(images, start=1):
+        for img_idx, image_path in enumerate(images, start=1):
             if self._stop_event.is_set():
                 break
 
-            output_path = output_dir / f"{image_path.stem}_mockup.png"
-
-            if output_path.exists() and not overwrite:
-                self.after(0, self._log,
-                           f"[{idx:>3}/{total}] SKIP  {image_path.name}  (already done)")
-                skipped += 1
-                self.after(0, self.progress_var.set, idx / total * 100)
-                continue
-
-            self.after(0, self._log,
-                       f"[{idx:>3}/{total}] Processing  {image_path.name} …")
-            self.after(0, self._set_status,
-                       f"Processing {idx}/{total}: {image_path.name}", "blue")
-
-            attempt = 0
-            while attempt < MAX_RETRIES:
-                try:
-                    ok = process_image(client, model, prompt, image_path, output_path,
-                                      aspect_ratio, image_size)
-                    if ok:
-                        self.after(0, self._log,
-                                   f"          saved → {output_path.name}")
-                        succeeded += 1
-                    else:
-                        self.after(0, self._log,
-                                   "          WARNING: API returned no image part")
-                        failed += 1
+            for p_idx, (suffix, prompt_text) in enumerate(prompts):
+                if self._stop_event.is_set():
                     break
 
-                except _RateLimitRetry as rl:
-                    attempt += 1
+                output_path = output_dir / f"{image_path.stem}_{suffix}.png"
+
+                if output_path.exists() and not overwrite:
                     self.after(0, self._log,
-                               f"          Rate limited. Waiting {rl.wait}s "
-                               f"(retry {rl.attempt}/{MAX_RETRIES-1})…")
-                    # Sleep in small increments so Stop works promptly
-                    for _ in range(rl.wait):
-                        if self._stop_event.is_set():
-                            break
-                        time.sleep(1)
+                               f"[{completed+1:>3}/{total_work}] SKIP  "
+                               f"{image_path.name} → {output_path.name}  (already done)")
+                    skipped += 1
+                    completed += 1
+                    self.after(0, self.progress_var.set, completed / total_work * 100)
+                    continue
 
-                except Exception as exc:
-                    self.after(0, self._log, f"          ERROR: {exc}")
-                    failed += 1
-                    break
+                label = image_path.name
+                if total_prompts > 1:
+                    label += f"  [prompt {suffix}]"
+                self.after(0, self._log,
+                           f"[{completed+1:>3}/{total_work}] Processing  {label} …")
+                self.after(0, self._set_status,
+                           f"Processing {completed+1}/{total_work}: {label}", "blue")
 
-            self.after(0, self.progress_var.set, idx / total * 100)
+                attempt = 0
+                while attempt < MAX_RETRIES:
+                    try:
+                        ok = process_image(client, model, prompt_text, image_path,
+                                           output_path, aspect_ratio, image_size)
+                        if ok:
+                            self.after(0, self._log,
+                                       f"          saved → {output_path.name}")
+                            succeeded += 1
+                        else:
+                            self.after(0, self._log,
+                                       "          WARNING: API returned no image part")
+                            failed += 1
+                        break
 
-            if not self._stop_event.is_set() and idx < total:
-                time.sleep(REQUEST_DELAY)
+                    except _RateLimitRetry as rl:
+                        attempt += 1
+                        self.after(0, self._log,
+                                   f"          Rate limited. Waiting {rl.wait}s "
+                                   f"(retry {rl.attempt}/{MAX_RETRIES-1})…")
+                        for _ in range(rl.wait):
+                            if self._stop_event.is_set():
+                                break
+                            time.sleep(1)
+
+                    except Exception as exc:
+                        self.after(0, self._log, f"          ERROR: {exc}")
+                        failed += 1
+                        break
+
+                completed += 1
+                self.after(0, self.progress_var.set, completed / total_work * 100)
+
+                # Delay between API calls (not after the very last one)
+                if not self._stop_event.is_set() and completed < total_work:
+                    time.sleep(REQUEST_DELAY)
 
         self.after(0, self._finish, succeeded, skipped, failed, output_dir)
 

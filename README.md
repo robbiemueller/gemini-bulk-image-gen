@@ -13,6 +13,7 @@ Originally built to create framed wall art product mockups from print designs (w
 
 - Browse to select input and output folders
 - Write any prompt — or use the built-in default
+- **Prompt sets** — group multiple prompts together and run every image through all of them in one batch
 - Choose model, aspect ratio, and output resolution
 - Progress bar and real-time log
 - Remembers your folders and settings between sessions
@@ -61,10 +62,27 @@ python generate_mockups.py
 2. Select a **model**, **aspect ratio**, and **resolution**
 3. Browse to your **input folder** (containing the images to process)
 4. Browse to your **output folder** (where results will be saved)
-5. Edit the **prompt** to describe the image transformation you want
+5. Choose a **prompt set** or write a single prompt (see below)
 6. Click **Run**
 
-Output files are saved as `<original_name>_mockup.png` in the output folder.
+### Single prompt mode
+
+Leave the prompt set dropdown on **"-- Single prompt --"** and write your prompt in the text area. Output files are saved as `<original_name>_mockup.png`.
+
+### Prompt sets (multi-prompt batch)
+
+Prompt sets let you run every image through multiple prompts in one go — useful for generating several different mockup styles per design.
+
+1. Click **New Set…** to open the prompt set editor
+2. Give the set a name (e.g. "Etsy Mockups")
+3. Click **+ Add** to add prompts — give each a short name and write the prompt text
+4. Use **↑ Up** / **↓ Down** to reorder prompts (the order determines output numbering)
+5. Click **Save Set**
+6. Select your set from the dropdown and click **Run**
+
+Output files are numbered by prompt order: `<original_name>_1.png`, `<original_name>_2.png`, etc.
+
+You can create as many sets as you need and switch between them from the dropdown. The selected set is remembered between sessions.
 
 ## Models
 

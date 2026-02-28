@@ -12,6 +12,8 @@ Everything lives in one file — no package structure, no modules. Keep it that 
 - **`process_image()`** — sends one image + prompt to the Gemini API, saves the result
 - **`_RateLimitRetry`** — internal exception used to signal 429 retries from `process_image` back up to the worker loop
 - **`App(tk.Tk)`** — the entire GUI; the worker runs in a background `threading.Thread`; all UI updates from the worker go through `self.after(0, ...)` to stay on the main thread
+- **Prompt sets** — named, ordered groups of prompts stored in `prompt_sets.json`; each image is processed through every prompt in the selected set
+- **Output naming** — single-prompt mode: `{stem}_mockup.png`; prompt-set mode: `{stem}_1.png`, `{stem}_2.png`, etc. (numbered by prompt order)
 
 ## Key constraints
 

@@ -23,6 +23,7 @@ ENV/
 # Local user config and saved prompts (personal, never commit)
 config.json
 prompts.json
+prompt_sets.json
 
 # Generated output images (don't accidentally commit API results)
 output/

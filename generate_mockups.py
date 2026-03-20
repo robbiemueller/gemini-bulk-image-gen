@@ -554,7 +554,7 @@ class App(tk.Tk):
     def _set_prompt_editor_enabled(self, enabled: bool):
         """Enable or disable the single-prompt editor area."""
         state = "normal" if enabled else "disabled"
-        fg = "" if enabled else "gray"
+        fg = "black" if enabled else "gray"
         self._prompt_label.configure(fg=fg)
         self._prompt_combo.configure(state="readonly" if enabled else "disabled")
         self._save_prompt_btn.configure(state=state)

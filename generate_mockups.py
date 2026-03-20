@@ -126,6 +126,11 @@ def collect_images(folder: Path) -> list[Path]:
     ]
 
 
+def sanitize_error(msg: str) -> str:
+    """Strip API keys and other secrets from error messages before logging."""
+    return re.sub(r'key=[A-Za-z0-9_-]+', 'key=REDACTED', msg)
+
+
 def extract_retry_delay(error_message: str) -> int:
     match = re.search(r'retry[^\d]*(\d+)', str(error_message), re.IGNORECASE)
     return int(match.group(1)) + 2 if match else RETRY_BASE_DELAY
@@ -1201,7 +1206,8 @@ class App(tk.Tk):
                             time.sleep(1)
 
                     except Exception as exc:
-                        self.after(0, self._log, f"          ERROR: {exc}")
+                        self.after(0, self._log,
+                                   f"          ERROR: {sanitize_error(str(exc))}")
                         failed += 1
                         break
 

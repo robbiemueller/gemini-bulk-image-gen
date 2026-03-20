@@ -169,6 +169,8 @@ def process_image(client: genai.Client, model: str, prompt: str,
 
         except Exception as exc:
             msg = str(exc)
+            if "503" in msg or "UNAVAILABLE" in msg:
+                raise _ServiceUnavailable(msg)
             if "429" in msg and attempt < MAX_RETRIES:
                 wait = extract_retry_delay(msg)
                 raise _RateLimitRetry(wait, attempt)
@@ -180,6 +182,11 @@ class _RateLimitRetry(Exception):
     def __init__(self, wait: int, attempt: int):
         self.wait = wait
         self.attempt = attempt
+
+
+class _ServiceUnavailable(Exception):
+    """The model is temporarily overloaded (503). Stop the run immediately."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1194,6 +1201,17 @@ class App(tk.Tk):
                                        "          WARNING: API returned no image part")
                             failed += 1
                         break
+
+                    except _ServiceUnavailable:
+                        self.after(0, self._log,
+                                   "          ERROR: Model is currently unavailable "
+                                   "(503). Google's servers are overloaded.")
+                        self.after(0, self._log,
+                                   "Stopping run — please try again later.")
+                        failed += 1
+                        self.after(0, self._finish, succeeded, skipped, failed,
+                                   output_dir)
+                        return
 
                     except _RateLimitRetry as rl:
                         attempt += 1

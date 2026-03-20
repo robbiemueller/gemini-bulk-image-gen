@@ -415,7 +415,8 @@ class App(tk.Tk):
                                   padx=10, pady=(0, 2))
 
         # --- Prompt (single-prompt editor) ---
-        tk.Label(self, text="Prompt:", anchor="nw").grid(row=7, column=0, sticky="nw", **pad)
+        self._prompt_label = tk.Label(self, text="Prompt:", anchor="nw")
+        self._prompt_label.grid(row=7, column=0, sticky="nw", **pad)
 
         prompt_col = tk.Frame(self)
         prompt_col.grid(row=7, column=1, columnspan=2, sticky="nsew", **pad)
@@ -432,10 +433,12 @@ class App(tk.Tk):
         self._prompt_combo.grid(row=0, column=0, sticky="ew")
         self._prompt_combo.bind("<<ComboboxSelected>>", self._on_prompt_selected)
 
-        tk.Button(prompt_toolbar, text="💾 Save", width=8,
-                  command=self._save_prompt).grid(row=0, column=1, padx=(6, 0))
-        tk.Button(prompt_toolbar, text="🗑 Delete", width=8,
-                  command=self._delete_prompt).grid(row=0, column=2, padx=(4, 0))
+        self._save_prompt_btn = tk.Button(prompt_toolbar, text="💾 Save", width=8,
+                                          command=self._save_prompt)
+        self._save_prompt_btn.grid(row=0, column=1, padx=(6, 0))
+        self._delete_prompt_btn = tk.Button(prompt_toolbar, text="🗑 Delete", width=8,
+                                            command=self._delete_prompt)
+        self._delete_prompt_btn.grid(row=0, column=2, padx=(4, 0))
 
         # Text area
         self.prompt_text = scrolledtext.ScrolledText(prompt_col, width=60, height=4, wrap=tk.WORD)
@@ -541,6 +544,18 @@ class App(tk.Tk):
 
     def _on_prompt_set_selected(self, _event=None):
         self._update_set_info()
+        self._set_prompt_editor_enabled(self._prompt_set_var.get() == _SINGLE_PROMPT)
+
+    def _set_prompt_editor_enabled(self, enabled: bool):
+        """Enable or disable the single-prompt editor area."""
+        state = "normal" if enabled else "disabled"
+        fg = "" if enabled else "gray"
+        self._prompt_label.configure(fg=fg)
+        self._prompt_combo.configure(state="readonly" if enabled else "disabled")
+        self._save_prompt_btn.configure(state=state)
+        self._delete_prompt_btn.configure(state=state)
+        self.prompt_text.configure(state=state,
+                                   bg="#ffffff" if enabled else "#f0f0f0")
 
     def _new_prompt_set(self):
         """Open the set editor dialog to create a new prompt set."""
@@ -944,6 +959,7 @@ class App(tk.Tk):
         else:
             self._prompt_set_var.set(_SINGLE_PROMPT)
         self._update_set_info()
+        self._set_prompt_editor_enabled(self._prompt_set_var.get() == _SINGLE_PROMPT)
 
     def _save_state(self):
         """Persist settings to config.json; API key goes to OS keychain only."""

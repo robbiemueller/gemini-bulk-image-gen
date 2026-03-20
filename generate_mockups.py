@@ -49,16 +49,37 @@ SCRIPT_DIR = Path(__file__).parent
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif"}
 
 MODELS = [
-    "gemini-3-pro-image-preview",    # highest quality, 4K support
-    "gemini-2.5-flash-image",        # faster, cheaper
+    "gemini-3-pro-image-preview",      # highest quality, 1K–4K
+    "gemini-3.1-flash-image-preview",  # fast, cheap, 512–4K
+    "gemini-2.5-flash-image",          # oldest, cheapest, up to 2K
 ]
 DEFAULT_MODEL = MODELS[0]
 
-ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "4:5", "5:4", "2:3", "3:2", "21:9"]
+# Standard ratios supported by all models.
+# 3.1-flash also supports 1:4, 4:1, 1:8, 8:1 (appended at the end).
+ASPECT_RATIOS = [
+    "1:1", "16:9", "9:16", "4:3", "3:4", "4:5", "5:4", "2:3", "3:2", "21:9",
+    "1:4", "4:1", "1:8", "8:1",
+]
 DEFAULT_ASPECT_RATIO = "1:1"
 
-IMAGE_SIZES = ["1K", "2K", "4K"]
+# "512" is the 0.5K tier — note: no "K" suffix (API requirement).
+IMAGE_SIZES = ["512", "1K", "2K", "4K"]
 DEFAULT_IMAGE_SIZE = "1K"
+
+# Approximate per-image output cost (USD) by model and resolution.
+# Source: https://ai.google.dev/gemini-api/docs/pricing (March 2026)
+COST_PER_IMAGE = {
+    "gemini-3-pro-image-preview": {
+        "1K": 0.134, "2K": 0.134, "4K": 0.24,
+    },
+    "gemini-3.1-flash-image-preview": {
+        "512": 0.045, "1K": 0.067, "2K": 0.101, "4K": 0.151,
+    },
+    "gemini-2.5-flash-image": {
+        "1K": 0.039, "2K": 0.039,
+    },
+}
 
 DEFAULT_PROMPT = (
     "Create a high-resolution, photorealistic interior product mockup featuring the provided artwork. "
@@ -362,7 +383,7 @@ class App(tk.Tk):
         self.image_size_var = tk.StringVar(value=DEFAULT_IMAGE_SIZE)
         ttk.Combobox(options_frame, textvariable=self.image_size_var,
                      values=IMAGE_SIZES, width=4, state="readonly").pack(side="left", padx=(4, 0))
-        tk.Label(options_frame, text="(4K: pro model only)", fg="gray",
+        tk.Label(options_frame, text="(512: 3.1 flash only · 4K: pro & 3.1 flash)", fg="gray",
                  font=("TkDefaultFont", 8)).pack(side="left", padx=(6, 0))
 
         # --- Prompt Set selector (NEW) ---
@@ -1003,6 +1024,43 @@ class App(tk.Tk):
                 self._log("ERROR: Prompt cannot be empty.")
                 return
             prompts = [("mockup", prompt_text)]
+
+        # --- Cost estimate & confirmation ---
+        images = collect_images(input_dir)
+        num_images = len(images)
+        if num_images == 0:
+            self._log("No supported images found in the input folder.")
+            return
+
+        num_prompts = len(prompts)
+        total_generations = num_images * num_prompts
+
+        # Look up per-image cost; fall back to a default for custom model IDs
+        model_costs = COST_PER_IMAGE.get(model)
+        if model_costs:
+            unit_cost = model_costs.get(image_size, max(model_costs.values()))
+            estimated_total = unit_cost * total_generations
+            cost_line = (
+                f"Estimated cost: {total_generations} image(s) "
+                f"× ${unit_cost:.3f} = ${estimated_total:.2f}"
+            )
+        else:
+            cost_line = (
+                f"Total generations: {total_generations} "
+                f"(cost unknown — custom model)"
+            )
+
+        confirm = messagebox.askyesno(
+            "Cost estimate",
+            f"Model: {model}\n"
+            f"Resolution: {image_size}\n"
+            f"Images: {num_images}  ×  Prompts: {num_prompts}\n\n"
+            f"{cost_line}\n\n"
+            f"Continue?",
+        )
+        if not confirm:
+            self._log("Run cancelled by user.")
+            return
 
         self._save_state()
         self._stop_event.clear()

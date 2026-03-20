@@ -50,6 +50,9 @@ python generate_mockups.py
 ## Model notes
 
 - `gemini-3-pro-image-preview` — highest quality, supports 1K/2K/4K output
-- `gemini-2.5-flash-image` — faster and cheaper, max 2K
-- Both use `client.models.generate_content()` with `types.ImageConfig` for aspect ratio and resolution
+- `gemini-3.1-flash-image-preview` — fast and cheap, supports 512/1K/2K/4K output; also supports extra aspect ratios (1:4, 4:1, 1:8, 8:1)
+- `gemini-2.5-flash-image` — oldest, cheapest, up to 2K
+- Image size `"512"` has no `K` suffix (API requirement); all others use `"1K"`, `"2K"`, `"4K"`
+- All use `client.models.generate_content()` with `types.ImageConfig` for aspect ratio and resolution
 - Imagen models (`imagen-3`, `imagen-4`) use a different API (`generate_images`) and don't accept a reference image — not supported here
+- **Cost estimate** — `COST_PER_IMAGE` dict maps model+resolution to approximate USD cost; shown to user in a confirmation dialog before each run

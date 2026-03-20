@@ -18,6 +18,7 @@ Originally built to create framed wall art product mockups from print designs (w
 - Progress bar and real-time log
 - Remembers your folders and settings between sessions
 - Optional secure API key saving via the OS keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service) — never stored in plaintext
+- **Cost estimate** — shows estimated cost and asks for confirmation before starting a batch
 - Skips already-processed images (with optional overwrite)
 - Handles rate limits automatically with retries
 
@@ -84,21 +85,24 @@ Output files are numbered by prompt order: `<original_name>_1.png`, `<original_n
 
 You can create as many sets as you need and switch between them from the dropdown. The selected set is remembered between sessions.
 
-## Models
+## Models & pricing
 
-| Model | Speed | Max Resolution | Notes |
+| Model | Speed | Resolutions | Cost per image (approx.) |
 |---|---|---|---|
-| `gemini-3-pro-image-preview` | Slower | 4K | Highest quality |
-| `gemini-2.5-flash-image` | Faster | 2K | Cheaper per image |
+| `gemini-3-pro-image-preview` | Slower | 1K, 2K, 4K | $0.13 (1K/2K) · $0.24 (4K) |
+| `gemini-3.1-flash-image-preview` | Fast | 512, 1K, 2K, 4K | $0.045–$0.151 |
+| `gemini-2.5-flash-image` | Fastest | 1K, 2K | $0.039 |
 
-## Pricing
+All models support 10 standard aspect ratios (`1:1`, `16:9`, `9:16`, `4:3`, `3:4`, `4:5`, `5:4`, `2:3`, `3:2`, `21:9`). The `gemini-3.1-flash-image-preview` model also supports ultra-wide/tall ratios: `1:4`, `4:1`, `1:8`, `8:1`.
 
-Each generated image costs approximately **$0.04** (1,290 output tokens at $30/1M tokens for the flash model). Check [Google AI pricing](https://ai.google.dev/pricing) for current rates.
+Before each run, the tool shows a **cost estimate** based on the number of images, prompts, model, and resolution — and asks you to confirm before proceeding.
+
+See [Google AI pricing](https://ai.google.dev/gemini-api/docs/pricing) for current rates.
 
 ## Tips
 
 - **Aspect ratio** — set this to match what you want in the output, not the input. The model will crop/compose accordingly.
-- **Resolution** — `1K` is fine for web use. Use `2K` or `4K` for print or large displays. Higher resolutions cost more and take longer.
+- **Resolution** — `1K` is fine for web use. Use `2K` or `4K` for print or large displays. Higher resolutions cost more and take longer. `512` (0.5K) is only available on `gemini-3.1-flash-image-preview`.
 - **Prompt** — be specific about style, framing, lighting, and context. The model uses both your image and the prompt together.
 - **Rate limits** — the tool retries automatically on 429 errors. For large batches, the 5-second delay between requests helps stay within limits.
 

@@ -1006,6 +1006,17 @@ class App(tk.Tk):
     def _set_status(self, msg: str, color: str = "gray"):
         self.status_label.configure(text=msg, fg=color)
 
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        s = int(seconds)
+        if s < 60:
+            return f"{s}s"
+        m, s = divmod(s, 60)
+        if m < 60:
+            return f"{m}m {s}s"
+        h, m = divmod(m, 60)
+        return f"{h}h {m}m"
+
     # ------------------------------------------------------------------
     # Run / Stop
     # ------------------------------------------------------------------
@@ -1159,6 +1170,8 @@ class App(tk.Tk):
         client = genai.Client(api_key=api_key)
         succeeded = skipped = failed = 0
         completed = 0
+        api_call_times: list[float] = []  # durations of actual API calls
+        run_start = time.monotonic()
 
         for img_idx, image_path in enumerate(images, start=1):
             if self._stop_event.is_set():
@@ -1190,8 +1203,10 @@ class App(tk.Tk):
                 attempt = 0
                 while attempt < MAX_RETRIES:
                     try:
+                        t0 = time.monotonic()
                         ok = process_image(client, model, prompt_text, image_path,
                                            output_path, aspect_ratio, image_size)
+                        api_call_times.append(time.monotonic() - t0)
                         if ok:
                             self.after(0, self._log,
                                        f"          saved → {output_path.name}")
@@ -1231,6 +1246,16 @@ class App(tk.Tk):
 
                 completed += 1
                 self.after(0, self.progress_var.set, completed / total_work * 100)
+
+                # Update ETA in status bar
+                remaining = total_work - completed
+                if api_call_times and remaining > 0:
+                    avg_time = sum(api_call_times) / len(api_call_times)
+                    eta_secs = remaining * (avg_time + REQUEST_DELAY)
+                    eta_str = self._format_eta(eta_secs)
+                    self.after(0, self._set_status,
+                               f"{completed}/{total_work} done  —  "
+                               f"~{eta_str} remaining", "blue")
 
                 # Delay between API calls (not after the very last one)
                 if not self._stop_event.is_set() and completed < total_work:

@@ -20,6 +20,7 @@ Setup:
 import io
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -170,7 +171,7 @@ def process_image(client: genai.Client, model: str, prompt: str,
         except Exception as exc:
             msg = str(exc)
             if "503" in msg or "UNAVAILABLE" in msg:
-                raise _ServiceUnavailable(msg)
+                raise _ServiceUnavailable(attempt)
             if "429" in msg and attempt < MAX_RETRIES:
                 wait = extract_retry_delay(msg)
                 raise _RateLimitRetry(wait, attempt)
@@ -185,8 +186,9 @@ class _RateLimitRetry(Exception):
 
 
 class _ServiceUnavailable(Exception):
-    """The model is temporarily overloaded (503). Stop the run immediately."""
-    pass
+    """The model is temporarily overloaded (503)."""
+    def __init__(self, attempt: int):
+        self.attempt = attempt
 
 
 # ---------------------------------------------------------------------------
@@ -1171,7 +1173,7 @@ class App(tk.Tk):
         succeeded = skipped = failed = 0
         completed = 0
         api_call_times: list[float] = []  # durations of actual API calls
-        run_start = time.monotonic()
+        eta_str = ""  # current ETA display string, updated after each item
 
         for img_idx, image_path in enumerate(images, start=1):
             if self._stop_event.is_set():
@@ -1197,8 +1199,10 @@ class App(tk.Tk):
                     label += f"  [prompt {suffix}]"
                 self.after(0, self._log,
                            f"[{completed+1:>3}/{total_work}] Processing  {label} …")
-                self.after(0, self._set_status,
-                           f"Processing {completed+1}/{total_work}: {label}", "blue")
+                status = f"Processing {completed+1}/{total_work}: {label}"
+                if eta_str:
+                    status += f"  —  ~{eta_str} remaining"
+                self.after(0, self._set_status, status, "blue")
 
                 attempt = 0
                 while attempt < MAX_RETRIES:
@@ -1218,15 +1222,22 @@ class App(tk.Tk):
                         break
 
                     except _ServiceUnavailable:
+                        attempt += 1
+                        if attempt >= MAX_RETRIES:
+                            self.after(0, self._log,
+                                       f"          ERROR: Model unavailable (503) "
+                                       f"after {MAX_RETRIES} attempts — skipping.")
+                            failed += 1
+                            break
+                        base = min(30 * (2 ** (attempt - 1)), 300)
+                        wait = int(base + random.uniform(0, base * 0.5))
                         self.after(0, self._log,
-                                   "          ERROR: Model is currently unavailable "
-                                   "(503). Google's servers are overloaded.")
-                        self.after(0, self._log,
-                                   "Stopping run — please try again later.")
-                        failed += 1
-                        self.after(0, self._finish, succeeded, skipped, failed,
-                                   output_dir)
-                        return
+                                   f"          Model unavailable (503). "
+                                   f"Waiting {wait}s (retry {attempt}/{MAX_RETRIES-1})…")
+                        for _ in range(wait):
+                            if self._stop_event.is_set():
+                                break
+                            time.sleep(1)
 
                     except _RateLimitRetry as rl:
                         attempt += 1
@@ -1247,15 +1258,14 @@ class App(tk.Tk):
                 completed += 1
                 self.after(0, self.progress_var.set, completed / total_work * 100)
 
-                # Update ETA in status bar
+                # Update ETA estimate (shown in status bar on next iteration)
                 remaining = total_work - completed
                 if api_call_times and remaining > 0:
                     avg_time = sum(api_call_times) / len(api_call_times)
                     eta_secs = remaining * (avg_time + REQUEST_DELAY)
                     eta_str = self._format_eta(eta_secs)
-                    self.after(0, self._set_status,
-                               f"{completed}/{total_work} done  —  "
-                               f"~{eta_str} remaining", "blue")
+                elif remaining == 0:
+                    eta_str = ""
 
                 # Delay between API calls (not after the very last one)
                 if not self._stop_event.is_set() and completed < total_work:

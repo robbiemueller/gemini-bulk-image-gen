@@ -10,8 +10,11 @@ Everything lives in one file — no package structure, no modules. Keep it that 
 
 - **`collect_images()`** — scans input folder for supported image types
 - **`process_image()`** — sends one image + prompt to the Gemini API, saves the result
-- **`_RateLimitRetry`** — internal exception used to signal 429 retries from `process_image` back up to the worker loop
+- **`_RateLimitRetry`** / **`_ServiceUnavailable`** — internal exceptions for 429/503 retries with exponential backoff, jitter, and a circuit breaker (5 consecutive 503-failed items stops the run)
 - **`App(tk.Tk)`** — the entire GUI; the worker runs in a background `threading.Thread`; all UI updates from the worker go through `self.after(0, ...)` to stay on the main thread
+- **Run modes** — *Real-time* (one API call at a time with progress) or *Batch* (submit all work as a single async Gemini Batch API job at 50% cost)
+- **Batch worker** — `_run_batch_worker` uploads images via the File API, builds a JSONL manifest, submits a batch job, polls for completion, then downloads and decodes results
+- **Batch resilience** — after job creation, state is saved to `batch_state.json` (job name, key→output mapping, output dir). The app can be closed and restarted; a "Resume Batch" button reconnects to the job via `_resume_batch()` / `_resume_batch_worker()`
 - **Prompt sets** — named, ordered groups of prompts stored in `prompt_sets.json`; each image is processed through every prompt in the selected set
 - **Output naming** — single-prompt mode: `{stem}_mockup.png`; prompt-set mode: `{stem}_1.png`, `{stem}_2.png`, etc. (numbered by prompt order)
 

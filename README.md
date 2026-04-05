@@ -14,13 +14,16 @@ Originally built to create framed wall art product mockups from print designs (w
 - Browse to select input and output folders
 - Write any prompt — or use the built-in default
 - **Prompt sets** — group multiple prompts together and run every image through all of them in one batch
+- **Two run modes**:
+  - **Real-time** — processes images one by one with live progress and ETA
+  - **Batch (50% off)** — submits all work as a single async job via the [Gemini Batch API](https://ai.google.dev/gemini-api/docs/batch-api), with higher rate limits and half the cost
 - Choose model, aspect ratio, and output resolution
-- Progress bar and real-time log
+- Progress bar, real-time log, and estimated time remaining
 - Remembers your folders and settings between sessions
 - Optional secure API key saving via the OS keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service) — never stored in plaintext
-- **Cost estimate** — shows estimated cost and asks for confirmation before starting a batch
+- **Cost estimate** — shows estimated cost (with batch discount if applicable) and asks for confirmation before starting
 - Skips already-processed images (with optional overwrite)
-- Handles rate limits automatically with retries
+- Handles rate limits (429) and server overload (503) automatically with exponential backoff, jitter, and a circuit breaker
 
 ## Requirements
 
@@ -85,6 +88,33 @@ Output files are numbered by prompt order: `<original_name>_1.png`, `<original_n
 
 You can create as many sets as you need and switch between them from the dropdown. The selected set is remembered between sessions.
 
+### Run modes
+
+The **Run mode** dropdown lets you choose how images are processed:
+
+#### Real-time (default)
+
+Images are processed one at a time. You see live progress, per-image status, and an estimated time remaining. Best for smaller batches or when you want to monitor results as they come in.
+
+#### Batch (50% off)
+
+All work is submitted as a single asynchronous job via the [Gemini Batch API](https://ai.google.dev/gemini-api/docs/batch-api). The app uploads your images, submits the job, then polls until it completes and downloads the results.
+
+**Advantages:**
+- **50% cheaper** — batch pricing is half the real-time rate
+- **Higher rate limits** — avoids the 503/429 errors common in large real-time runs
+- **Fire and forget** — submit a large job and let it run
+
+**Trade-offs:**
+- No per-image progress during processing — you see the job status (pending → running → succeeded) but not individual images
+- Turnaround is variable — usually minutes, but Google targets up to 24 hours
+- Results arrive all at once when the job completes
+
+**Resuming a batch job:**
+Once a batch job is submitted, the job state is saved locally. You can safely close the app, restart your computer, or come back later — click **Resume Batch** to reconnect to the job, poll for completion, and download results. The Resume button appears automatically on startup if a pending job is detected.
+
+The batch discount is reflected in the cost estimate confirmation dialog.
+
 ## Models & pricing
 
 | Model | Speed | Resolutions | Cost per image (approx.) |
@@ -95,7 +125,7 @@ You can create as many sets as you need and switch between them from the dropdow
 
 All models support 10 standard aspect ratios (`1:1`, `16:9`, `9:16`, `4:3`, `3:4`, `4:5`, `5:4`, `2:3`, `3:2`, `21:9`). The `gemini-3.1-flash-image-preview` model also supports ultra-wide/tall ratios: `1:4`, `4:1`, `1:8`, `8:1`.
 
-Before each run, the tool shows a **cost estimate** based on the number of images, prompts, model, and resolution — and asks you to confirm before proceeding.
+Before each run, the tool shows a **cost estimate** based on the number of images, prompts, model, and resolution — and asks you to confirm before proceeding. Batch mode applies a 50% discount to the estimate.
 
 See [Google AI pricing](https://ai.google.dev/gemini-api/docs/pricing) for current rates.
 
@@ -104,7 +134,8 @@ See [Google AI pricing](https://ai.google.dev/gemini-api/docs/pricing) for curre
 - **Aspect ratio** — set this to match what you want in the output, not the input. The model will crop/compose accordingly.
 - **Resolution** — `1K` is fine for web use. Use `2K` or `4K` for print or large displays. Higher resolutions cost more and take longer. `512` (0.5K) is only available on `gemini-3.1-flash-image-preview`.
 - **Prompt** — be specific about style, framing, lighting, and context. The model uses both your image and the prompt together.
-- **Rate limits** — the tool retries automatically on 429 errors. For large batches, the 5-second delay between requests helps stay within limits.
+- **Rate limits / 503 errors** — the tool retries automatically with exponential backoff on both 429 (rate limit) and 503 (server overload) errors. If 5 consecutive items fail with 503 after all retries, the run stops automatically (circuit breaker). For large batches, consider using **Batch mode** which has higher rate limits.
+- **Batch mode for large runs** — if you're processing hundreds of images, Batch mode avoids rate-limit issues entirely and costs 50% less.
 
 ## Supported input formats
 

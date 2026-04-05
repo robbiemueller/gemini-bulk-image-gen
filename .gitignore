@@ -24,6 +24,7 @@ ENV/
 config.json
 prompts.json
 prompt_sets.json
+batch_state.json
 
 # Generated output images (don't accidentally commit API results)
 output/

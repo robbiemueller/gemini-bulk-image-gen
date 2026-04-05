@@ -17,12 +17,14 @@ Setup:
            python generate_mockups.py
 """
 
+import base64
 import io
 import json
 import os
 import random
 import re
 import sys
+import tempfile
 import time
 import threading
 import tkinter as tk
@@ -113,6 +115,19 @@ RETRY_BASE_DELAY = 60
 
 # Circuit breaker: stop the run after this many consecutive items fail with 503
 CIRCUIT_BREAKER_THRESHOLD = 5
+
+# Batch API settings
+BATCH_POLL_INTERVAL = 30   # seconds between status polls
+BATCH_TERMINAL_STATES = {
+    "JOB_STATE_SUCCEEDED",
+    "JOB_STATE_FAILED",
+    "JOB_STATE_CANCELLED",
+    "JOB_STATE_EXPIRED",
+    "JOB_STATE_PARTIALLY_SUCCEEDED",
+}
+
+# Run mode options
+RUN_MODES = ["Real-time", "Batch (50% off)"]
 
 # Sentinel value for the prompt-set dropdown
 _SINGLE_PROMPT = "-- Single prompt --"
@@ -321,6 +336,42 @@ def save_prompt_sets(sets: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Batch job state  (batch_state.json — persists active batch job across restarts)
+# ---------------------------------------------------------------------------
+
+BATCH_STATE_FILE = SCRIPT_DIR / "batch_state.json"
+
+
+def load_batch_state() -> dict | None:
+    """Return the saved batch job state, or None."""
+    try:
+        if BATCH_STATE_FILE.exists():
+            with BATCH_STATE_FILE.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def save_batch_state(state: dict) -> None:
+    """Persist the active batch job state to disk."""
+    try:
+        with BATCH_STATE_FILE.open("w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def clear_batch_state() -> None:
+    """Remove the batch state file."""
+    try:
+        if BATCH_STATE_FILE.exists():
+            BATCH_STATE_FILE.unlink()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 
@@ -332,6 +383,7 @@ class App(tk.Tk):
         self.geometry("880x800")
         self.minsize(700, 580)
         self._stop_event = threading.Event()
+        self._batch_job_name: str | None = None  # active batch job for cancellation
         self._config = load_config()
         self._prompts: list[dict] = load_prompts()       # individual saved prompts
         self._prompt_sets: list[dict] = load_prompt_sets()  # prompt sets
@@ -404,11 +456,22 @@ class App(tk.Tk):
         tk.Label(options_frame, text="(512: 3.1 flash only · 4K: pro & 3.1 flash)", fg="gray",
                  font=("TkDefaultFont", 8)).pack(side="left", padx=(6, 0))
 
+        # Second options row for run mode
+        options_frame2 = tk.Frame(self)
+        options_frame2.grid(row=5, column=1, columnspan=2, sticky="w", **pad)
+
+        tk.Label(options_frame2, text="Run mode:").pack(side="left")
+        self.run_mode_var = tk.StringVar(value=RUN_MODES[0])
+        ttk.Combobox(options_frame2, textvariable=self.run_mode_var,
+                     values=RUN_MODES, width=14, state="readonly").pack(side="left", padx=(4, 12))
+        tk.Label(options_frame2, text="Batch sends all work as one async job · cheaper · higher rate limits",
+                 fg="gray", font=("TkDefaultFont", 8)).pack(side="left")
+
         # --- Prompt Set selector (NEW) ---
-        tk.Label(self, text="Prompt set:", anchor="w").grid(row=5, column=0, sticky="w", **pad)
+        tk.Label(self, text="Prompt set:", anchor="w").grid(row=6, column=0, sticky="w", **pad)
 
         set_col = tk.Frame(self)
-        set_col.grid(row=5, column=1, columnspan=2, sticky="ew", **pad)
+        set_col.grid(row=6, column=1, columnspan=2, sticky="ew", **pad)
 
         self._prompt_set_var = tk.StringVar(value=_SINGLE_PROMPT)
         self._prompt_set_combo = ttk.Combobox(set_col, textvariable=self._prompt_set_var,
@@ -429,15 +492,15 @@ class App(tk.Tk):
                                         anchor="w", fg="gray",
                                         font=("TkDefaultFont", 8), wraplength=600,
                                         justify="left")
-        self._set_info_label.grid(row=6, column=1, columnspan=2, sticky="w",
+        self._set_info_label.grid(row=7, column=1, columnspan=2, sticky="w",
                                   padx=10, pady=(0, 2))
 
         # --- Prompt (single-prompt editor) ---
         self._prompt_label = tk.Label(self, text="Prompt:", anchor="nw")
-        self._prompt_label.grid(row=7, column=0, sticky="nw", **pad)
+        self._prompt_label.grid(row=8, column=0, sticky="nw", **pad)
 
         prompt_col = tk.Frame(self)
-        prompt_col.grid(row=7, column=1, columnspan=2, sticky="nsew", **pad)
+        prompt_col.grid(row=8, column=1, columnspan=2, sticky="nsew", **pad)
         prompt_col.columnconfigure(0, weight=1)
 
         # Toolbar: saved-prompt picker + Save + Delete
@@ -468,23 +531,23 @@ class App(tk.Tk):
         self.progress_var = tk.DoubleVar(value=0)
         self.progress_bar = ttk.Progressbar(
             self, variable=self.progress_var, maximum=100, length=400)
-        self.progress_bar.grid(row=8, column=0, columnspan=3, sticky="ew", **pad)
+        self.progress_bar.grid(row=9, column=0, columnspan=3, sticky="ew", **pad)
 
         self.status_label = tk.Label(self, text="", anchor="w", fg="gray")
-        self.status_label.grid(row=9, column=0, columnspan=3, sticky="w", **pad)
+        self.status_label.grid(row=10, column=0, columnspan=3, sticky="w", **pad)
 
         # --- Log ---
         self.log = scrolledtext.ScrolledText(self, width=70, height=8, state="disabled",
                                              wrap=tk.WORD, bg="#1e1e1e", fg="#d4d4d4",
                                              font=("TkFixedFont", 9))
-        self.log.grid(row=10, column=0, columnspan=3, sticky="nsew", **pad)
+        self.log.grid(row=11, column=0, columnspan=3, sticky="nsew", **pad)
 
         # --- Buttons ---
         # Native ttk themes (vista, aqua) ignore fg/bg on buttons.
         # "clam" is a built-in cross-platform theme that honours colours;
         # we scope it to a named style so all other widgets keep their OS look.
         btn_frame = tk.Frame(self)
-        btn_frame.grid(row=11, column=0, columnspan=3, pady=10)
+        btn_frame.grid(row=12, column=0, columnspan=3, pady=10)
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Run.TButton",
@@ -495,6 +558,13 @@ class App(tk.Tk):
                   background=[("active", "#005fa3"), ("disabled", "#a0a0a0")],
                   foreground=[("disabled", "#d0d0d0")])
         style.configure("Stop.TButton", padding=6)
+        style.configure("Resume.TButton",
+                        foreground="white", background="#2d8a4e",
+                        font=("TkDefaultFont", 10, "bold"),
+                        padding=6)
+        style.map("Resume.TButton",
+                  background=[("active", "#1e6b3a"), ("disabled", "#a0a0a0")],
+                  foreground=[("disabled", "#d0d0d0")])
         self.run_btn = ttk.Button(btn_frame, text="Run", width=14,
                                   style="Run.TButton", command=self._start)
         self.run_btn.pack(side="left", padx=6)
@@ -502,11 +572,16 @@ class App(tk.Tk):
                                    style="Stop.TButton",
                                    state="disabled", command=self._request_stop)
         self.stop_btn.pack(side="left", padx=6)
+        self.resume_btn = ttk.Button(btn_frame, text="Resume Batch", width=14,
+                                     style="Resume.TButton",
+                                     state="disabled",
+                                     command=self._resume_batch)
+        self.resume_btn.pack(side="left", padx=6)
 
         # Make columns/rows resize gracefully.
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(7, weight=1)    # prompt editor
-        self.rowconfigure(10, weight=2)   # log
+        self.rowconfigure(8, weight=1)    # prompt editor
+        self.rowconfigure(11, weight=2)   # log
 
         # Disable "Save API key" if keyring is not installed
         if not _KEYRING_AVAILABLE:
@@ -958,6 +1033,8 @@ class App(tk.Tk):
             self.image_size_var.set(c["image_size"])
         if "overwrite" in c:
             self.overwrite_var.set(c["overwrite"])
+        if c.get("run_mode") in RUN_MODES:
+            self.run_mode_var.set(c["run_mode"])
 
         if not _KEYRING_AVAILABLE:
             self.save_api_key_var.set(False)
@@ -979,6 +1056,16 @@ class App(tk.Tk):
         self._update_set_info()
         self._set_prompt_editor_enabled(self._prompt_set_var.get() == _SINGLE_PROMPT)
 
+        # Check for a pending batch job from a previous session
+        batch = load_batch_state()
+        if batch and batch.get("job_name"):
+            self.resume_btn.configure(state="normal")
+            self.after(200, self._log,
+                       f"Pending batch job found: {batch['job_name']}\n"
+                       f"  Output folder: {batch.get('output_dir', '?')}\n"
+                       f"  Items: {len(batch.get('key_map', {}))}\n"
+                       "Click 'Resume Batch' to reconnect and download results.")
+
     def _save_state(self):
         """Persist settings to config.json; API key goes to OS keychain only."""
         save_api = self.save_api_key_var.get()
@@ -997,6 +1084,7 @@ class App(tk.Tk):
             "overwrite":            self.overwrite_var.get(),
             _SAVE_API_KEY:          save_api,
             "selected_prompt_set":  self._prompt_set_var.get(),
+            "run_mode":             self.run_mode_var.get(),
         })
 
     # ------------------------------------------------------------------
@@ -1071,6 +1159,9 @@ class App(tk.Tk):
             prompts = [("mockup", prompt_text)]
 
         # --- Cost estimate & confirmation ---
+        run_mode = self.run_mode_var.get()
+        is_batch = run_mode.startswith("Batch")
+
         images = collect_images(input_dir)
         num_images = len(images)
         if num_images == 0:
@@ -1084,19 +1175,25 @@ class App(tk.Tk):
         model_costs = COST_PER_IMAGE.get(model)
         if model_costs:
             unit_cost = model_costs.get(image_size, max(model_costs.values()))
+            if is_batch:
+                unit_cost *= 0.5
             estimated_total = unit_cost * total_generations
             cost_line = (
                 f"Estimated cost: {total_generations} image(s) "
                 f"× ${unit_cost:.3f} = ${estimated_total:.2f}"
             )
+            if is_batch:
+                cost_line += "  (50% batch discount)"
         else:
             cost_line = (
                 f"Total generations: {total_generations} "
                 f"(cost unknown — custom model)"
             )
 
+        mode_label = "Batch" if is_batch else "Real-time"
         confirm = messagebox.askyesno(
             "Cost estimate",
+            f"Mode: {mode_label}\n"
             f"Model: {model}\n"
             f"Resolution: {image_size}\n"
             f"Images: {num_images}  ×  Prompts: {num_prompts}\n\n"
@@ -1113,21 +1210,208 @@ class App(tk.Tk):
         self.stop_btn.configure(state="normal")
         self.progress_var.set(0)
 
+        if is_batch:
+            thread = threading.Thread(
+                target=self._run_batch_worker,
+                args=(api_key, model, prompts, input_dir, output_dir,
+                      self.overwrite_var.get(), aspect_ratio, image_size),
+                daemon=True,
+            )
+        else:
+            thread = threading.Thread(
+                target=self._run_worker,
+                args=(api_key, model, prompts, input_dir, output_dir,
+                      self.overwrite_var.get(), aspect_ratio, image_size),
+                daemon=True,
+            )
+        thread.start()
+
+    def _resume_batch(self):
+        """Resume a previously submitted batch job from saved state."""
+        state = load_batch_state()
+        if not state or not state.get("job_name"):
+            self._log("No pending batch job found.")
+            return
+
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning("API Key Required",
+                                   "Please enter your API key before resuming.")
+            return
+
+        job_name = state["job_name"]
+        key_map = state.get("key_map", {})
+        output_dir = Path(state.get("output_dir", "."))
+        skipped = state.get("skipped", 0)
+
+        self._log(f"\nResuming batch job: {job_name}")
+        self._log(f"  Output folder: {output_dir}")
+        self._log(f"  Items: {len(key_map)}")
+
+        self._stop_event.clear()
+        self.run_btn.configure(state="disabled")
+        self.resume_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.progress_var.set(30)  # start at 30% (upload+submit already done)
+
         thread = threading.Thread(
-            target=self._run_worker,
-            args=(api_key, model, prompts, input_dir, output_dir,
-                  self.overwrite_var.get(), aspect_ratio, image_size),
+            target=self._resume_batch_worker,
+            args=(api_key, job_name, key_map, output_dir, skipped),
             daemon=True,
         )
         thread.start()
 
+    def _resume_batch_worker(self, api_key, job_name, key_map, output_dir, skipped):
+        """Background thread: poll a previously submitted batch job and download results."""
+        client = genai.Client(api_key=api_key)
+        self._batch_job_name = job_name
+
+        # --- Poll for completion ---
+        self.after(0, self._set_status, f"Reconnected — polling {job_name}…", "blue")
+        self.after(0, self._log, "Polling for completion…")
+        poll_failures = 0
+        state = None
+
+        while True:
+            if self._stop_event.is_set():
+                try:
+                    client.batches.cancel(name=self._batch_job_name)
+                    self.after(0, self._log, "Batch cancellation requested.")
+                except Exception:
+                    pass
+                self.after(0, self._finish, 0, skipped, len(key_map), output_dir)
+                return
+
+            try:
+                batch_job = client.batches.get(name=self._batch_job_name)
+                state = batch_job.state.name if hasattr(batch_job.state, 'name') else str(batch_job.state)
+                poll_failures = 0
+            except Exception as exc:
+                poll_failures += 1
+                self.after(0, self._log,
+                           f"  Poll error ({poll_failures}): "
+                           f"{sanitize_error(str(exc))}")
+                if poll_failures >= 10:
+                    self.after(0, self._log,
+                               "Too many consecutive poll failures — aborting.\n"
+                               "The batch job may still be running. "
+                               "Try 'Resume Batch' again later.")
+                    self.after(0, self._finish, 0, skipped, len(key_map), output_dir)
+                    return
+                for _ in range(BATCH_POLL_INTERVAL):
+                    if self._stop_event.is_set():
+                        break
+                    time.sleep(1)
+                continue
+
+            self.after(0, self._set_status,
+                       f"Batch status: {state}", "blue")
+            self.after(0, self._log, f"  Status: {state}")
+
+            if state in BATCH_TERMINAL_STATES:
+                break
+
+            for _ in range(BATCH_POLL_INTERVAL):
+                if self._stop_event.is_set():
+                    break
+                time.sleep(1)
+
+        # --- Handle terminal state ---
+        if state in ("JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"):
+            reason = state.replace("JOB_STATE_", "").lower()
+            self.after(0, self._log, f"\nBatch job {reason}.")
+            if state == "JOB_STATE_FAILED":
+                try:
+                    err = getattr(batch_job, 'error', None)
+                    if err:
+                        self.after(0, self._log, f"  Error: {err}")
+                except Exception:
+                    pass
+            self.after(0, self._finish, 0, skipped, len(key_map), output_dir)
+            return
+
+        # --- Download and process results ---
+        self.after(0, self._set_status, "Downloading results…", "blue")
+        self.after(0, self._log, "\nDownloading results…")
+        try:
+            result_file = batch_job.dest.file_name
+            result_bytes = client.files.download(file=result_file)
+            if not isinstance(result_bytes, bytes):
+                result_bytes = result_bytes.read()
+        except Exception as exc:
+            self.after(0, self._log,
+                       f"ERROR downloading results: {sanitize_error(str(exc))}")
+            self.after(0, self._finish, 0, skipped, len(key_map), output_dir)
+            return
+
+        # key_map values are strings (from JSON); convert to Path
+        key_to_output = {k: Path(v) for k, v in key_map.items()}
+        succeeded = failed = 0
+
+        lines = result_bytes.decode("utf-8").strip().split("\n")
+        total_results = len(lines)
+        for i, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as exc:
+                self.after(0, self._log, f"  Malformed result line: {exc}")
+                failed += 1
+                continue
+
+            key = entry.get("key", "unknown")
+            out_path = key_to_output.get(key)
+
+            if "error" in entry:
+                self.after(0, self._log,
+                           f"  FAILED [{key}]: {entry['error']}")
+                failed += 1
+                continue
+
+            try:
+                parts = entry["response"]["candidates"][0]["content"]["parts"]
+                saved = False
+                for part in parts:
+                    inline = part.get("inlineData")
+                    if inline and inline.get("mimeType", "").startswith("image/"):
+                        img_data = base64.b64decode(inline["data"])
+                        img = Image.open(io.BytesIO(img_data))
+                        if out_path:
+                            out_path.parent.mkdir(parents=True, exist_ok=True)
+                            img.save(out_path)
+                            self.after(0, self._log,
+                                       f"  Saved: {out_path.name}")
+                        succeeded += 1
+                        saved = True
+                        break
+                if not saved:
+                    self.after(0, self._log,
+                               f"  WARNING [{key}]: No image in response")
+                    failed += 1
+            except Exception as exc:
+                self.after(0, self._log,
+                           f"  ERROR [{key}]: {sanitize_error(str(exc))}")
+                failed += 1
+
+            self.after(0, self.progress_var.set,
+                       30 + (i / total_results * 70))
+
+        self.after(0, self._finish, succeeded, skipped, failed, output_dir)
+
     def _request_stop(self):
         self._stop_event.set()
-        self._set_status("Stopping after current image…", "orange")
+        if self._batch_job_name:
+            self._set_status("Cancelling batch job…", "orange")
+        else:
+            self._set_status("Stopping after current image…", "orange")
 
     def _finish(self, succeeded: int, skipped: int, failed: int, output_dir: Path):
+        self._batch_job_name = None
+        clear_batch_state()
         self.run_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.resume_btn.configure(state="disabled")
         self._log(
             f"\nDone.  Succeeded: {succeeded}  |  Skipped: {skipped}  |  Failed: {failed}"
         )
@@ -1296,6 +1580,317 @@ class App(tk.Tk):
                 # Delay between API calls (not after the very last one)
                 if not self._stop_event.is_set() and completed < total_work:
                     time.sleep(REQUEST_DELAY)
+
+        self.after(0, self._finish, succeeded, skipped, failed, output_dir)
+
+    # ------------------------------------------------------------------
+    # Batch worker (runs in a background thread)
+    # ------------------------------------------------------------------
+
+    def _run_batch_worker(self, api_key, model, prompts, input_dir, output_dir,
+                          overwrite, aspect_ratio, image_size):
+        """Submit all work as a single Gemini Batch API job."""
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.after(0, self._log, f"ERROR creating output folder: {exc}")
+            self.after(0, self._finish, 0, 0, 1, output_dir)
+            return
+
+        images = collect_images(input_dir)
+        total_images = len(images)
+        total_prompts = len(prompts)
+
+        self.after(0, self._log, f"Found {total_images} image(s) in {input_dir}")
+        self.after(0, self._log,
+                   f"Model: {model}  |  Aspect ratio: {aspect_ratio}  "
+                   f"|  Resolution: {image_size}  |  Mode: BATCH")
+
+        if total_images == 0:
+            self.after(0, self._finish, 0, 0, 0, output_dir)
+            return
+
+        # Build work items, applying skip logic
+        work_items = []  # (key, image_path, prompt_text, output_path)
+        skipped = 0
+        for image_path in images:
+            for suffix, prompt_text in prompts:
+                output_path = output_dir / f"{image_path.stem}_{suffix}.png"
+                if output_path.exists() and not overwrite:
+                    skipped += 1
+                    continue
+                key = f"{image_path.stem}___{suffix}"
+                work_items.append((key, image_path, prompt_text, output_path))
+
+        if skipped:
+            self.after(0, self._log, f"Skipped {skipped} already-done item(s).")
+        if not work_items:
+            self.after(0, self._log, "All items already done — nothing to submit.")
+            self.after(0, self._finish, 0, skipped, 0, output_dir)
+            return
+
+        self.after(0, self._log,
+                   f"Submitting {len(work_items)} generation(s) as a batch job…\n")
+
+        client = genai.Client(api_key=api_key)
+
+        # --- Phase 1: Upload input images to File API ---
+        unique_images = list({item[1]: None for item in work_items}.keys())
+        uploaded_files = {}  # image_path -> uploaded file object
+        self.after(0, self._set_status,
+                   f"Uploading images to File API… (0/{len(unique_images)})", "blue")
+        for i, img_path in enumerate(unique_images, 1):
+            if self._stop_event.is_set():
+                self.after(0, self._log, "Cancelled during upload.")
+                self.after(0, self._finish, 0, skipped, 0, output_dir)
+                return
+            try:
+                mime = MIME_MAP.get(img_path.suffix.lower(), "image/jpeg")
+                f = client.files.upload(
+                    file=str(img_path),
+                    config=types.UploadFileConfig(
+                        display_name=img_path.name,
+                        mime_type=mime,
+                    ),
+                )
+                uploaded_files[img_path] = f
+                self.after(0, self._set_status,
+                           f"Uploading images to File API… ({i}/{len(unique_images)})",
+                           "blue")
+                self.after(0, self.progress_var.set,
+                           i / len(unique_images) * 25)  # 0-25% for uploads
+            except Exception as exc:
+                self.after(0, self._log,
+                           f"ERROR uploading {img_path.name}: "
+                           f"{sanitize_error(str(exc))}")
+                self.after(0, self._finish, 0, skipped, len(work_items), output_dir)
+                return
+
+        self.after(0, self._log,
+                   f"Uploaded {len(uploaded_files)} image(s) to File API.")
+
+        # --- Phase 2: Build and upload JSONL ---
+        self.after(0, self._set_status, "Building and uploading JSONL…", "blue")
+        try:
+            jsonl_lines = []
+            for key, image_path, prompt_text, _ in work_items:
+                file_obj = uploaded_files[image_path]
+                mime = MIME_MAP.get(image_path.suffix.lower(), "image/jpeg")
+                line = {
+                    "key": key,
+                    "request": {
+                        "contents": [{
+                            "parts": [
+                                {"fileData": {
+                                    "fileUri": file_obj.uri,
+                                    "mimeType": mime,
+                                }},
+                                {"text": prompt_text},
+                            ]
+                        }],
+                        "generationConfig": {
+                            "responseModalities": ["TEXT", "IMAGE"],
+                            "imageConfig": {
+                                "aspectRatio": aspect_ratio,
+                                "imageSize": image_size,
+                            },
+                        },
+                    },
+                }
+                jsonl_lines.append(json.dumps(line))
+
+            jsonl_content = "\n".join(jsonl_lines) + "\n"
+
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".jsonl", delete=False, encoding="utf-8")
+            tmp.write(jsonl_content)
+            tmp.close()
+
+            uploaded_jsonl = client.files.upload(
+                file=tmp.name,
+                config=types.UploadFileConfig(
+                    display_name="batch-requests.jsonl",
+                    mime_type="jsonl",
+                ),
+            )
+            os.unlink(tmp.name)
+            self.after(0, self._log,
+                       f"Uploaded JSONL ({len(jsonl_lines)} requests).")
+
+        except Exception as exc:
+            self.after(0, self._log,
+                       f"ERROR building/uploading JSONL: "
+                       f"{sanitize_error(str(exc))}")
+            self.after(0, self._finish, 0, skipped, len(work_items), output_dir)
+            return
+
+        # --- Phase 3: Create batch job ---
+        self.after(0, self._set_status, "Creating batch job…", "blue")
+        try:
+            batch_job = client.batches.create(
+                model=model,
+                src=uploaded_jsonl.name,
+                config={"display_name": f"bulk-image-gen-{int(time.time())}"},
+            )
+            self._batch_job_name = batch_job.name
+            # Persist job state so it survives app restarts
+            key_map = {key: str(out_path) for key, _, _, out_path in work_items}
+            save_batch_state({
+                "job_name": batch_job.name,
+                "model": model,
+                "output_dir": str(output_dir),
+                "key_map": key_map,
+                "skipped": skipped,
+                "submitted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            self.after(0, self._log,
+                       f"Batch job created: {batch_job.name}")
+            self.after(0, self._log,
+                       "Job state saved — you can safely close the app and "
+                       "resume later via 'Resume Batch'.")
+        except Exception as exc:
+            self.after(0, self._log,
+                       f"ERROR creating batch job: {sanitize_error(str(exc))}")
+            self.after(0, self._finish, 0, skipped, len(work_items), output_dir)
+            return
+
+        self.after(0, self.progress_var.set, 30)
+
+        # --- Phase 4: Poll for completion ---
+        self.after(0, self._log, "Polling for completion…")
+        poll_failures = 0
+        while True:
+            if self._stop_event.is_set():
+                try:
+                    client.batches.cancel(name=self._batch_job_name)
+                    self.after(0, self._log, "Batch cancellation requested.")
+                except Exception:
+                    pass
+                self.after(0, self._finish, 0, skipped, len(work_items), output_dir)
+                return
+
+            try:
+                batch_job = client.batches.get(name=self._batch_job_name)
+                state = batch_job.state.name if hasattr(batch_job.state, 'name') else str(batch_job.state)
+                poll_failures = 0
+            except Exception as exc:
+                poll_failures += 1
+                self.after(0, self._log,
+                           f"  Poll error ({poll_failures}): "
+                           f"{sanitize_error(str(exc))}")
+                if poll_failures >= 10:
+                    self.after(0, self._log,
+                               "Too many consecutive poll failures — aborting.")
+                    self.after(0, self._finish, 0, skipped, len(work_items),
+                               output_dir)
+                    return
+                for _ in range(BATCH_POLL_INTERVAL):
+                    if self._stop_event.is_set():
+                        break
+                    time.sleep(1)
+                continue
+
+            self.after(0, self._set_status,
+                       f"Batch status: {state}", "blue")
+            self.after(0, self._log, f"  Status: {state}")
+
+            if state in BATCH_TERMINAL_STATES:
+                break
+
+            # Sleep in small increments so Stop is responsive
+            for _ in range(BATCH_POLL_INTERVAL):
+                if self._stop_event.is_set():
+                    break
+                time.sleep(1)
+
+        # --- Phase 5: Handle terminal state ---
+        if state in ("JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"):
+            reason = state.replace("JOB_STATE_", "").lower()
+            self.after(0, self._log, f"\nBatch job {reason}.")
+            if state == "JOB_STATE_FAILED":
+                # Try to get error details
+                try:
+                    err = getattr(batch_job, 'error', None)
+                    if err:
+                        self.after(0, self._log, f"  Error: {err}")
+                except Exception:
+                    pass
+            self.after(0, self._finish, 0, skipped, len(work_items), output_dir)
+            return
+
+        # --- Phase 6: Download and process results ---
+        self.after(0, self._set_status, "Downloading results…", "blue")
+        self.after(0, self._log, "\nDownloading results…")
+        try:
+            result_file = batch_job.dest.file_name
+            result_bytes = client.files.download(file=result_file)
+            if not isinstance(result_bytes, bytes):
+                result_bytes = result_bytes.read()
+        except Exception as exc:
+            self.after(0, self._log,
+                       f"ERROR downloading results: {sanitize_error(str(exc))}")
+            self.after(0, self._finish, 0, skipped, len(work_items), output_dir)
+            return
+
+        # Build key -> output_path mapping
+        key_to_output = {key: out_path for key, _, _, out_path in work_items}
+        succeeded = failed = 0
+
+        lines = result_bytes.decode("utf-8").strip().split("\n")
+        total_results = len(lines)
+        for i, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as exc:
+                self.after(0, self._log, f"  Malformed result line: {exc}")
+                failed += 1
+                continue
+
+            key = entry.get("key", "unknown")
+            out_path = key_to_output.get(key)
+
+            if "error" in entry:
+                self.after(0, self._log,
+                           f"  FAILED [{key}]: {entry['error']}")
+                failed += 1
+                continue
+
+            try:
+                parts = entry["response"]["candidates"][0]["content"]["parts"]
+                saved = False
+                for part in parts:
+                    inline = part.get("inlineData")
+                    if inline and inline.get("mimeType", "").startswith("image/"):
+                        img_data = base64.b64decode(inline["data"])
+                        img = Image.open(io.BytesIO(img_data))
+                        if out_path:
+                            img.save(out_path)
+                            self.after(0, self._log,
+                                       f"  Saved: {out_path.name}")
+                        succeeded += 1
+                        saved = True
+                        break
+                if not saved:
+                    self.after(0, self._log,
+                               f"  WARNING [{key}]: No image in response")
+                    failed += 1
+            except Exception as exc:
+                self.after(0, self._log,
+                           f"  ERROR [{key}]: {sanitize_error(str(exc))}")
+                failed += 1
+
+            self.after(0, self.progress_var.set,
+                       30 + (i / total_results * 70))  # 30-100%
+
+        # --- Cleanup: delete uploaded files ---
+        try:
+            for file_obj in uploaded_files.values():
+                client.files.delete(name=file_obj.name)
+            client.files.delete(name=uploaded_jsonl.name)
+        except Exception:
+            pass  # best-effort cleanup
 
         self.after(0, self._finish, succeeded, skipped, failed, output_dir)
 

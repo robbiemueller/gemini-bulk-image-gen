@@ -174,7 +174,7 @@ def process_image(client: genai.Client, model: str, prompt: str,
         except Exception as exc:
             msg = str(exc)
             if "503" in msg or "UNAVAILABLE" in msg:
-                raise _ServiceUnavailable(attempt)
+                raise _ServiceUnavailable(attempt, sanitize_error(msg))
             if "429" in msg and attempt < MAX_RETRIES:
                 wait = extract_retry_delay(msg)
                 raise _RateLimitRetry(wait, attempt)
@@ -190,8 +190,9 @@ class _RateLimitRetry(Exception):
 
 class _ServiceUnavailable(Exception):
     """The model is temporarily overloaded (503)."""
-    def __init__(self, attempt: int):
+    def __init__(self, attempt: int, detail: str = ""):
         self.attempt = attempt
+        self.detail = detail
 
 
 # ---------------------------------------------------------------------------
@@ -1227,20 +1228,24 @@ class App(tk.Tk):
                         consecutive_503s = 0  # reset on any successful API call
                         break
 
-                    except _ServiceUnavailable:
+                    except _ServiceUnavailable as su:
                         attempt += 1
                         if attempt >= MAX_RETRIES:
                             self.after(0, self._log,
                                        f"          ERROR: Model unavailable (503) "
                                        f"after {MAX_RETRIES} attempts — skipping.")
+                            self.after(0, self._log,
+                                       f"          Last error: {su.detail}")
                             failed += 1
                             item_503 = True
                             break
                         base = min(30 * (2 ** (attempt - 1)), 300)
                         wait = int(base + random.uniform(0, base * 0.5))
                         self.after(0, self._log,
-                                   f"          Model unavailable (503). "
-                                   f"Waiting {wait}s (retry {attempt}/{MAX_RETRIES-1})…")
+                                   f"          503: {su.detail}")
+                        self.after(0, self._log,
+                                   f"          Waiting {wait}s "
+                                   f"(retry {attempt}/{MAX_RETRIES-1})…")
                         for _ in range(wait):
                             if self._stop_event.is_set():
                                 break

@@ -107,9 +107,12 @@ MIME_MAP = {
 # Seconds to wait between successful requests
 REQUEST_DELAY = 5
 
-# Retry settings for rate-limit (429) errors
+# Retry settings for rate-limit (429) and service-unavailable (503) errors
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 60
+
+# Circuit breaker: stop the run after this many consecutive items fail with 503
+CIRCUIT_BREAKER_THRESHOLD = 5
 
 # Sentinel value for the prompt-set dropdown
 _SINGLE_PROMPT = "-- Single prompt --"
@@ -1174,6 +1177,7 @@ class App(tk.Tk):
         completed = 0
         api_call_times: list[float] = []  # durations of actual API calls
         eta_str = ""  # current ETA display string, updated after each item
+        consecutive_503s = 0  # circuit breaker: consecutive items that failed with 503
 
         for img_idx, image_path in enumerate(images, start=1):
             if self._stop_event.is_set():
@@ -1205,6 +1209,7 @@ class App(tk.Tk):
                 self.after(0, self._set_status, status, "blue")
 
                 attempt = 0
+                item_503 = False  # did this item exhaust retries on 503?
                 while attempt < MAX_RETRIES:
                     try:
                         t0 = time.monotonic()
@@ -1219,6 +1224,7 @@ class App(tk.Tk):
                             self.after(0, self._log,
                                        "          WARNING: API returned no image part")
                             failed += 1
+                        consecutive_503s = 0  # reset on any successful API call
                         break
 
                     except _ServiceUnavailable:
@@ -1228,6 +1234,7 @@ class App(tk.Tk):
                                        f"          ERROR: Model unavailable (503) "
                                        f"after {MAX_RETRIES} attempts — skipping.")
                             failed += 1
+                            item_503 = True
                             break
                         base = min(30 * (2 ** (attempt - 1)), 300)
                         wait = int(base + random.uniform(0, base * 0.5))
@@ -1254,6 +1261,20 @@ class App(tk.Tk):
                                    f"          ERROR: {sanitize_error(str(exc))}")
                         failed += 1
                         break
+
+                # Circuit breaker: stop if too many consecutive 503 failures
+                if item_503:
+                    consecutive_503s += 1
+                    if consecutive_503s >= CIRCUIT_BREAKER_THRESHOLD:
+                        self.after(0, self._log,
+                                   f"\n*** {CIRCUIT_BREAKER_THRESHOLD} consecutive "
+                                   f"items failed with 503 — service appears "
+                                   f"degraded. Stopping run. ***")
+                        self.after(0, self._log,
+                                   "Try again later when the model is less busy.")
+                        self.after(0, self._finish, succeeded, skipped, failed,
+                                   output_dir)
+                        return
 
                 completed += 1
                 self.after(0, self.progress_var.set, completed / total_work * 100)

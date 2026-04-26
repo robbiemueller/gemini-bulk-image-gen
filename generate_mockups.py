@@ -2,17 +2,22 @@
 generate_mockups.py
 
 Opens a GUI to select an input folder, output folder, and prompt, then sends
-each image to the Gemini API and saves the resulting mockup PNGs.
+each image to the selected provider's image-generation API (Google Gemini or
+OpenAI) and saves the resulting PNGs.
 
 Requirements:
-    Billing must be enabled on your Google AI Studio / Google Cloud account.
-    Image-generation models have no free-tier quota (limit = 0).
+    - Gemini: billing enabled on Google AI Studio (no free tier for image gen)
+    - OpenAI: an account with image-generation access
 
 Setup:
-    1. Enable billing: https://aistudio.google.com/plan_information
-    2. Set your API key:
-           Windows (PowerShell): $env:GOOGLE_API_KEY = "your_key_here"
-           macOS/Linux:          export GOOGLE_API_KEY="your_key_here"
+    1. Enable Gemini billing (if using Gemini): https://aistudio.google.com/plan_information
+    2. Set the API key for whichever provider(s) you'll use:
+           Windows (PowerShell):
+               $env:GOOGLE_API_KEY = "your_gemini_key_here"
+               $env:OPENAI_API_KEY = "your_openai_key_here"
+           macOS/Linux:
+               export GOOGLE_API_KEY="your_gemini_key_here"
+               export OPENAI_API_KEY="your_openai_key_here"
     3. Run:
            python generate_mockups.py
 """
@@ -41,6 +46,14 @@ except ImportError:
 
 from google import genai
 from google.genai import types
+
+try:
+    from openai import OpenAI
+    import openai as _openai_module
+    _OPENAI_AVAILABLE = True
+except ImportError:
+    _OPENAI_AVAILABLE = False
+
 from PIL import Image
 
 # ---------------------------------------------------------------------------
@@ -51,13 +64,31 @@ SCRIPT_DIR = Path(__file__).parent
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif"}
 
-MODELS = [
+# --- Providers ---
+PROVIDERS = ["Gemini", "OpenAI"]
+DEFAULT_PROVIDER = "Gemini"
+
+GEMINI_MODELS = [
     "gemini-3-pro-image-preview",      # highest quality, 1K–4K
     "gemini-3.1-flash-image-preview",  # fast, cheap, 512–4K
     "gemini-2.5-flash-image",          # oldest, cheapest, up to 2K
 ]
-DEFAULT_MODEL = MODELS[0]
+OPENAI_MODELS = [
+    "gpt-image-2",        # latest, highest quality
+    "gpt-image-1.5",
+    "gpt-image-1",
+    "gpt-image-1-mini",   # cheapest
+]
+MODELS_BY_PROVIDER = {
+    "Gemini": GEMINI_MODELS,
+    "OpenAI": OPENAI_MODELS,
+}
+PROVIDER_FOR_MODEL = {m: "Gemini" for m in GEMINI_MODELS}
+PROVIDER_FOR_MODEL.update({m: "OpenAI" for m in OPENAI_MODELS})
 
+DEFAULT_MODEL = GEMINI_MODELS[0]
+
+# --- Gemini sizing controls ---
 # Standard ratios supported by all models.
 # 3.1-flash also supports 1:4, 4:1, 1:8, 8:1 (appended at the end).
 ASPECT_RATIOS = [
@@ -70,8 +101,21 @@ DEFAULT_ASPECT_RATIO = "1:1"
 IMAGE_SIZES = ["512", "1K", "2K", "4K"]
 DEFAULT_IMAGE_SIZE = "1K"
 
-# Approximate per-image output cost (USD) by model and resolution.
-# Source: https://ai.google.dev/gemini-api/docs/pricing (March 2026)
+# --- OpenAI sizing controls ---
+# Source: https://developers.openai.com/api/docs/guides/image-generation
+OPENAI_SIZES = ["auto", "1024x1024", "1024x1536", "1536x1024", "2048x2048", "3840x2160"]
+DEFAULT_OPENAI_SIZE = "1024x1024"
+
+OPENAI_QUALITIES = ["auto", "low", "medium", "high"]
+DEFAULT_OPENAI_QUALITY = "auto"
+
+# --- Per-image cost lookup (USD) ---
+# Gemini: keyed by image_size  ("512" / "1K" / "2K" / "4K")
+#   Source: https://ai.google.dev/gemini-api/docs/pricing (March 2026)
+# OpenAI: keyed by "{size}/{quality}" e.g. "1024x1024/medium"
+#   Source: https://developers.openai.com/api/docs/guides/image-generation
+#   (gpt-image-2 only — other variants left blank so the cost dialog falls through
+#    to the "unknown — proceed?" path)
 COST_PER_IMAGE = {
     "gemini-3-pro-image-preview": {
         "1K": 0.134, "2K": 0.134, "4K": 0.24,
@@ -81,6 +125,11 @@ COST_PER_IMAGE = {
     },
     "gemini-2.5-flash-image": {
         "1K": 0.039, "2K": 0.039,
+    },
+    "gpt-image-2": {
+        "1024x1024/low":    0.006, "1024x1024/medium": 0.053, "1024x1024/high": 0.211,
+        "1024x1536/low":    0.005, "1024x1536/medium": 0.041, "1024x1536/high": 0.165,
+        "1536x1024/low":    0.005, "1536x1024/medium": 0.041, "1536x1024/high": 0.165,
     },
 }
 
@@ -197,6 +246,48 @@ def process_image(client: genai.Client, model: str, prompt: str,
                 raise
 
 
+def process_image_openai(client, model: str, prompt: str,
+                         image_path: Path, output_path: Path,
+                         size: str = DEFAULT_OPENAI_SIZE,
+                         quality: str = DEFAULT_OPENAI_QUALITY) -> bool:
+    """Send one image + prompt to OpenAI's images.edit endpoint, save the result."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            kwargs = {"model": model, "prompt": prompt}
+            if size and size != "auto":
+                kwargs["size"] = size
+            if quality and quality != "auto":
+                kwargs["quality"] = quality
+            with open(image_path, "rb") as f:
+                result = client.images.edit(image=f, **kwargs)
+
+            b64 = result.data[0].b64_json
+            if not b64:
+                return False
+            img = Image.open(io.BytesIO(base64.b64decode(b64)))
+            img.save(output_path)
+            return True
+
+        except Exception as exc:
+            msg = str(exc)
+            # Detect rate limit / service unavailable across SDK versions.
+            rate_limited = (
+                _OPENAI_AVAILABLE
+                and isinstance(exc, getattr(_openai_module, "RateLimitError", ()))
+            ) or "429" in msg
+            unavailable = (
+                "503" in msg
+                or "UNAVAILABLE" in msg.upper()
+                or "overloaded" in msg.lower()
+            )
+
+            if unavailable:
+                raise _ServiceUnavailable(attempt, sanitize_error(msg))
+            if rate_limited and attempt < MAX_RETRIES:
+                raise _RateLimitRetry(extract_retry_delay(msg), attempt)
+            raise
+
+
 class _RateLimitRetry(Exception):
     def __init__(self, wait: int, attempt: int):
         self.wait = wait
@@ -217,8 +308,18 @@ class _ServiceUnavailable(Exception):
 
 CONFIG_FILE = SCRIPT_DIR / "config.json"
 
-_KEYCHAIN_SERVICE = "gemini-bulk-image-gen"
-_KEYCHAIN_USER    = "google_api_key"
+_KEYCHAIN_SERVICES = {
+    "Gemini": "gemini-bulk-image-gen",
+    "OpenAI": "openai-bulk-image-gen",
+}
+_KEYCHAIN_USERS = {
+    "Gemini": "google_api_key",
+    "OpenAI": "openai_api_key",
+}
+_API_KEY_ENV_VARS = {
+    "Gemini": "GOOGLE_API_KEY",
+    "OpenAI": "OPENAI_API_KEY",
+}
 _SAVE_API_KEY     = "save_api_key"   # boolean flag stored in config.json
 
 
@@ -242,32 +343,38 @@ def save_config(data: dict) -> None:
         pass
 
 
-def keychain_load_api_key() -> str:
-    """Return the API key from the OS keychain, or '' on any error."""
+def keychain_load_api_key(provider: str = "Gemini") -> str:
+    """Return the saved API key for *provider* from the OS keychain, or '' on any error."""
     if not _KEYRING_AVAILABLE:
         return ""
     try:
-        return keyring.get_password(_KEYCHAIN_SERVICE, _KEYCHAIN_USER) or ""
+        return keyring.get_password(
+            _KEYCHAIN_SERVICES[provider], _KEYCHAIN_USERS[provider]
+        ) or ""
     except Exception:
         return ""
 
 
-def keychain_save_api_key(api_key: str) -> None:
-    """Store the API key in the OS keychain, silently ignore errors."""
+def keychain_save_api_key(api_key: str, provider: str = "Gemini") -> None:
+    """Store the API key for *provider* in the OS keychain, silently ignore errors."""
     if not _KEYRING_AVAILABLE:
         return
     try:
-        keyring.set_password(_KEYCHAIN_SERVICE, _KEYCHAIN_USER, api_key)
+        keyring.set_password(
+            _KEYCHAIN_SERVICES[provider], _KEYCHAIN_USERS[provider], api_key
+        )
     except Exception:
         pass
 
 
-def keychain_delete_api_key() -> None:
-    """Remove the API key from the OS keychain, silently ignore errors."""
+def keychain_delete_api_key(provider: str = "Gemini") -> None:
+    """Remove the API key for *provider* from the OS keychain, silently ignore errors."""
     if not _KEYRING_AVAILABLE:
         return
     try:
-        keyring.delete_password(_KEYCHAIN_SERVICE, _KEYCHAIN_USER)
+        keyring.delete_password(
+            _KEYCHAIN_SERVICES[provider], _KEYCHAIN_USERS[provider]
+        )
     except keyring.errors.PasswordDeleteError:
         pass
     except Exception:
@@ -378,7 +485,7 @@ def clear_batch_state() -> None:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Gemini Bulk Image Generator")
+        self.title("Bulk Image Generator (Gemini + OpenAI)")
         self.resizable(True, True)
         self.geometry("880x800")
         self.minsize(700, 580)
@@ -387,6 +494,10 @@ class App(tk.Tk):
         self._config = load_config()
         self._prompts: list[dict] = load_prompts()       # individual saved prompts
         self._prompt_sets: list[dict] = load_prompt_sets()  # prompt sets
+        # Suppresses the auto-clear of the API key field when the provider
+        # change is being driven by _load_state (so the env var / saved value
+        # we just populated isn't wiped).
+        self._suppress_api_key_swap = False
         self._build_ui()
         self._load_state()
 
@@ -398,8 +509,11 @@ class App(tk.Tk):
         pad = {"padx": 10, "pady": 5}
 
         # --- API key ---
-        tk.Label(self, text="API Key:", anchor="w").grid(row=0, column=0, sticky="w", **pad)
-        self.api_key_var = tk.StringVar(value=os.environ.get("GOOGLE_API_KEY", ""))
+        self._api_key_label = tk.Label(self, text="API Key:", anchor="w")
+        self._api_key_label.grid(row=0, column=0, sticky="w", **pad)
+        self.api_key_var = tk.StringVar(
+            value=os.environ.get(_API_KEY_ENV_VARS[DEFAULT_PROVIDER], "")
+        )
         api_row = tk.Frame(self)
         api_row.grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
         api_entry = tk.Entry(api_row, textvariable=self.api_key_var, show="*", width=44)
@@ -409,15 +523,23 @@ class App(tk.Tk):
                                            variable=self.save_api_key_var)
         self._save_key_cb.pack(side="left", padx=(10, 0))
 
-        # --- Model ---
-        tk.Label(self, text="Model:", anchor="w").grid(row=1, column=0, sticky="w", **pad)
+        # --- Provider + Model ---
+        tk.Label(self, text="Provider:", anchor="w").grid(row=1, column=0, sticky="w", **pad)
+        self.provider_var = tk.StringVar(value=DEFAULT_PROVIDER)
+        prov_frame = tk.Frame(self)
+        prov_frame.grid(row=1, column=1, columnspan=2, sticky="ew", **pad)
+        self._provider_combo = ttk.Combobox(prov_frame, textvariable=self.provider_var,
+                                            values=PROVIDERS, width=10, state="readonly")
+        self._provider_combo.pack(side="left")
+        self._provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
+
+        tk.Label(prov_frame, text="  Model:").pack(side="left")
         self.model_var = tk.StringVar(value=DEFAULT_MODEL)
-        model_frame = tk.Frame(self)
-        model_frame.grid(row=1, column=1, columnspan=2, sticky="ew", **pad)
-        model_combo = ttk.Combobox(model_frame, textvariable=self.model_var,
-                                   values=MODELS, width=38)
-        model_combo.pack(side="left")
-        tk.Label(model_frame, text="  (or type a custom model ID)", fg="gray",
+        self._model_combo = ttk.Combobox(prov_frame, textvariable=self.model_var,
+                                         values=MODELS_BY_PROVIDER[DEFAULT_PROVIDER],
+                                         width=34)
+        self._model_combo.pack(side="left", padx=(4, 0))
+        tk.Label(prov_frame, text="  (or type a custom model ID)", fg="gray",
                  font=("TkDefaultFont", 8)).pack(side="left")
 
         # --- Input folder ---
@@ -444,17 +566,29 @@ class App(tk.Tk):
         tk.Checkbutton(options_frame, text="Overwrite existing outputs",
                        variable=self.overwrite_var).pack(side="left", padx=(0, 20))
 
-        tk.Label(options_frame, text="Aspect ratio:").pack(side="left")
-        self.aspect_ratio_var = tk.StringVar(value=DEFAULT_ASPECT_RATIO)
-        ttk.Combobox(options_frame, textvariable=self.aspect_ratio_var,
-                     values=ASPECT_RATIOS, width=6, state="readonly").pack(side="left", padx=(4, 16))
+        # Two dropdowns whose label/values flip based on the active provider.
+        # Gemini: Aspect ratio + Resolution (1K/2K/4K/512)
+        # OpenAI: Size (1024x1024 etc.) + Quality (auto/low/medium/high)
+        self.aspect_ratio_var  = tk.StringVar(value=DEFAULT_ASPECT_RATIO)
+        self.image_size_var    = tk.StringVar(value=DEFAULT_IMAGE_SIZE)
+        self.openai_size_var    = tk.StringVar(value=DEFAULT_OPENAI_SIZE)
+        self.openai_quality_var = tk.StringVar(value=DEFAULT_OPENAI_QUALITY)
 
-        tk.Label(options_frame, text="Resolution:").pack(side="left")
-        self.image_size_var = tk.StringVar(value=DEFAULT_IMAGE_SIZE)
-        ttk.Combobox(options_frame, textvariable=self.image_size_var,
-                     values=IMAGE_SIZES, width=4, state="readonly").pack(side="left", padx=(4, 0))
-        tk.Label(options_frame, text="(512: 3.1 flash only · 4K: pro & 3.1 flash)", fg="gray",
-                 font=("TkDefaultFont", 8)).pack(side="left", padx=(6, 0))
+        self._opt1_label = tk.Label(options_frame, text="Aspect ratio:")
+        self._opt1_label.pack(side="left")
+        self._opt1_combo = ttk.Combobox(options_frame, textvariable=self.aspect_ratio_var,
+                                        values=ASPECT_RATIOS, width=10, state="readonly")
+        self._opt1_combo.pack(side="left", padx=(4, 16))
+
+        self._opt2_label = tk.Label(options_frame, text="Resolution:")
+        self._opt2_label.pack(side="left")
+        self._opt2_combo = ttk.Combobox(options_frame, textvariable=self.image_size_var,
+                                        values=IMAGE_SIZES, width=10, state="readonly")
+        self._opt2_combo.pack(side="left", padx=(4, 0))
+        self._opt_hint = tk.Label(options_frame,
+                                  text="(512: 3.1 flash only · 4K: pro & 3.1 flash)",
+                                  fg="gray", font=("TkDefaultFont", 8))
+        self._opt_hint.pack(side="left", padx=(6, 0))
 
         # Second options row for run mode
         options_frame2 = tk.Frame(self)
@@ -462,10 +596,14 @@ class App(tk.Tk):
 
         tk.Label(options_frame2, text="Run mode:").pack(side="left")
         self.run_mode_var = tk.StringVar(value=RUN_MODES[0])
-        ttk.Combobox(options_frame2, textvariable=self.run_mode_var,
-                     values=RUN_MODES, width=14, state="readonly").pack(side="left", padx=(4, 12))
-        tk.Label(options_frame2, text="Batch sends all work as one async job · cheaper · higher rate limits",
-                 fg="gray", font=("TkDefaultFont", 8)).pack(side="left")
+        self._run_mode_combo = ttk.Combobox(options_frame2, textvariable=self.run_mode_var,
+                                            values=RUN_MODES, width=14, state="readonly")
+        self._run_mode_combo.pack(side="left", padx=(4, 12))
+        self._run_mode_hint = tk.Label(
+            options_frame2,
+            text="Batch sends all work as one async job · cheaper · higher rate limits",
+            fg="gray", font=("TkDefaultFont", 8))
+        self._run_mode_hint.pack(side="left")
 
         # --- Prompt Set selector (NEW) ---
         tk.Label(self, text="Prompt set:", anchor="w").grid(row=6, column=0, sticky="w", **pad)
@@ -591,12 +729,68 @@ class App(tk.Tk):
     # Folder pickers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Provider switch
+    # ------------------------------------------------------------------
+
+    def _on_provider_change(self, _event=None):
+        """Reconfigure model list, size/quality controls, run mode, and API key
+        for the currently selected provider."""
+        provider = self.provider_var.get()
+
+        # Model dropdown
+        models = MODELS_BY_PROVIDER.get(provider, [])
+        self._model_combo.configure(values=models)
+        if self.model_var.get() not in models:
+            self.model_var.set(models[0] if models else "")
+
+        # Size / quality controls
+        if provider == "OpenAI":
+            self._opt1_label.configure(text="Size:")
+            self._opt1_combo.configure(textvariable=self.openai_size_var,
+                                       values=OPENAI_SIZES)
+            self._opt2_label.configure(text="Quality:")
+            self._opt2_combo.configure(textvariable=self.openai_quality_var,
+                                       values=OPENAI_QUALITIES)
+            self._opt_hint.configure(
+                text="(size 'auto' lets the model pick · gpt-image-2 priced per size+quality)")
+        else:
+            self._opt1_label.configure(text="Aspect ratio:")
+            self._opt1_combo.configure(textvariable=self.aspect_ratio_var,
+                                       values=ASPECT_RATIOS)
+            self._opt2_label.configure(text="Resolution:")
+            self._opt2_combo.configure(textvariable=self.image_size_var,
+                                       values=IMAGE_SIZES)
+            self._opt_hint.configure(
+                text="(512: 3.1 flash only · 4K: pro & 3.1 flash)")
+
+        # Run mode — Batch is Gemini-only
+        if provider == "OpenAI":
+            self.run_mode_var.set(RUN_MODES[0])  # Real-time
+            self._run_mode_combo.configure(state="disabled")
+            self._run_mode_hint.configure(
+                text="Batch mode is Gemini-only — OpenAI runs in real-time.")
+        else:
+            self._run_mode_combo.configure(state="readonly")
+            self._run_mode_hint.configure(
+                text="Batch sends all work as one async job · cheaper · higher rate limits")
+
+        # API key field — swap to whatever was saved for this provider, falling
+        # back to the provider's env var. Skipped during _load_state to avoid
+        # clobbering a value the user (or _load_state) just set.
+        if not self._suppress_api_key_swap:
+            saved = keychain_load_api_key(provider) if self.save_api_key_var.get() else ""
+            self.api_key_var.set(
+                saved or os.environ.get(_API_KEY_ENV_VARS[provider], "")
+            )
+
     def _pick_input(self):
         folder = filedialog.askdirectory(title="Select input folder")
         if folder:
             self.input_var.set(folder)
             if not self.output_var.get():
-                self.output_var.set(str(Path(folder) / "gemini"))
+                subfolder = "openai" if self.provider_var.get() == "OpenAI" else "gemini"
+                self.output_var.set(str(Path(folder) / subfolder))
 
     def _pick_output(self):
         folder = filedialog.askdirectory(title="Select output folder")
@@ -1015,11 +1209,21 @@ class App(tk.Tk):
         """Populate widgets from saved config and OS keychain."""
         c = self._config
 
-        # API key priority: env var > OS keychain (if opted in) > empty
+        # Restore provider first so we know which keychain slot to read.
+        saved_provider = c.get("provider")
+        if saved_provider in PROVIDERS:
+            self.provider_var.set(saved_provider)
+        provider = self.provider_var.get()
+
+        # API key priority: env var > OS keychain (if opted in) > empty.
+        # The env var was already populated for DEFAULT_PROVIDER in _build_ui;
+        # if the saved provider is different, refresh from its env var.
+        if saved_provider and saved_provider != DEFAULT_PROVIDER:
+            self.api_key_var.set(os.environ.get(_API_KEY_ENV_VARS[provider], ""))
         if c.get(_SAVE_API_KEY):
             self.save_api_key_var.set(True)
             if not self.api_key_var.get():
-                self.api_key_var.set(keychain_load_api_key())
+                self.api_key_var.set(keychain_load_api_key(provider))
 
         if c.get("input_dir"):
             self.input_var.set(c["input_dir"])
@@ -1031,10 +1235,22 @@ class App(tk.Tk):
             self.aspect_ratio_var.set(c["aspect_ratio"])
         if c.get("image_size") in IMAGE_SIZES:
             self.image_size_var.set(c["image_size"])
+        if c.get("openai_size") in OPENAI_SIZES:
+            self.openai_size_var.set(c["openai_size"])
+        if c.get("openai_quality") in OPENAI_QUALITIES:
+            self.openai_quality_var.set(c["openai_quality"])
         if "overwrite" in c:
             self.overwrite_var.set(c["overwrite"])
         if c.get("run_mode") in RUN_MODES:
             self.run_mode_var.set(c["run_mode"])
+
+        # Now apply the provider's UI changes (model list, label swaps, etc.).
+        # Suppress the API-key auto-swap since we just populated it above.
+        self._suppress_api_key_swap = True
+        try:
+            self._on_provider_change()
+        finally:
+            self._suppress_api_key_swap = False
 
         if not _KEYRING_AVAILABLE:
             self.save_api_key_var.set(False)
@@ -1069,18 +1285,22 @@ class App(tk.Tk):
     def _save_state(self):
         """Persist settings to config.json; API key goes to OS keychain only."""
         save_api = self.save_api_key_var.get()
+        provider = self.provider_var.get()
 
         if save_api:
-            keychain_save_api_key(self.api_key_var.get())
+            keychain_save_api_key(self.api_key_var.get(), provider)
         else:
-            keychain_delete_api_key()
+            keychain_delete_api_key(provider)
 
         save_config({
+            "provider":             provider,
             "input_dir":            self.input_var.get(),
             "output_dir":           self.output_var.get(),
             "model":                self.model_var.get(),
             "aspect_ratio":         self.aspect_ratio_var.get(),
             "image_size":           self.image_size_var.get(),
+            "openai_size":          self.openai_size_var.get(),
+            "openai_quality":       self.openai_quality_var.get(),
             "overwrite":            self.overwrite_var.get(),
             _SAVE_API_KEY:          save_api,
             "selected_prompt_set":  self._prompt_set_var.get(),
@@ -1120,11 +1340,17 @@ class App(tk.Tk):
         input_dir = Path(self.input_var.get().strip())
         output_dir = Path(self.output_var.get().strip())
         model = self.model_var.get().strip()
+        provider = self.provider_var.get()
         aspect_ratio = self.aspect_ratio_var.get()
         image_size = self.image_size_var.get()
+        openai_size = self.openai_size_var.get()
+        openai_quality = self.openai_quality_var.get()
 
         if not api_key:
             self._log("ERROR: API key is required.")
+            return
+        if provider == "OpenAI" and not _OPENAI_AVAILABLE:
+            self._log("ERROR: OpenAI SDK not installed. Run: pip install openai")
             return
         if not input_dir or not input_dir.is_dir():
             self._log("ERROR: Select a valid input folder.")
@@ -1162,6 +1388,12 @@ class App(tk.Tk):
         run_mode = self.run_mode_var.get()
         is_batch = run_mode.startswith("Batch")
 
+        # Defense-in-depth: the UI already locks Real-time when OpenAI is selected,
+        # but make sure no edge case slips through.
+        if is_batch and provider == "OpenAI":
+            self._log("ERROR: Batch mode is Gemini-only. Switch to Real-time.")
+            return
+
         images = collect_images(input_dir)
         num_images = len(images)
         if num_images == 0:
@@ -1171,12 +1403,21 @@ class App(tk.Tk):
         num_prompts = len(prompts)
         total_generations = num_images * num_prompts
 
-        # Look up per-image cost; fall back to a default for custom model IDs
+        # Look up per-image cost; fall back for unknown model/size combos.
+        if provider == "OpenAI":
+            cost_key = f"{openai_size}/{openai_quality}"
+            size_label = f"{openai_size} · {openai_quality}"
+        else:
+            cost_key = image_size
+            size_label = image_size
+
         model_costs = COST_PER_IMAGE.get(model)
-        if model_costs:
-            unit_cost = model_costs.get(image_size, max(model_costs.values()))
+        unit_cost = model_costs.get(cost_key) if model_costs else None
+        if unit_cost is None and model_costs:
+            unit_cost = max(model_costs.values())
+        if unit_cost is not None:
             if is_batch:
-                unit_cost *= 0.5
+                unit_cost *= 0.5  # Gemini batch discount
             estimated_total = unit_cost * total_generations
             cost_line = (
                 f"Estimated cost: {total_generations} image(s) "
@@ -1187,15 +1428,16 @@ class App(tk.Tk):
         else:
             cost_line = (
                 f"Total generations: {total_generations} "
-                f"(cost unknown — custom model)"
+                f"(cost unknown — custom model or pricing not on file)"
             )
 
         mode_label = "Batch" if is_batch else "Real-time"
         confirm = messagebox.askyesno(
             "Cost estimate",
+            f"Provider: {provider}\n"
             f"Mode: {mode_label}\n"
             f"Model: {model}\n"
-            f"Resolution: {image_size}\n"
+            f"Output: {size_label}\n"
             f"Images: {num_images}  ×  Prompts: {num_prompts}\n\n"
             f"{cost_line}\n\n"
             f"Continue?",
@@ -1220,8 +1462,9 @@ class App(tk.Tk):
         else:
             thread = threading.Thread(
                 target=self._run_worker,
-                args=(api_key, model, prompts, input_dir, output_dir,
-                      self.overwrite_var.get(), aspect_ratio, image_size),
+                args=(api_key, provider, model, prompts, input_dir, output_dir,
+                      self.overwrite_var.get(), aspect_ratio, image_size,
+                      openai_size, openai_quality),
                 daemon=True,
             )
         thread.start()
@@ -1425,12 +1668,15 @@ class App(tk.Tk):
     # Worker (runs in a background thread)
     # ------------------------------------------------------------------
 
-    def _run_worker(self, api_key, model, prompts, input_dir, output_dir, overwrite,
-                    aspect_ratio, image_size):
+    def _run_worker(self, api_key, provider, model, prompts, input_dir, output_dir,
+                    overwrite, aspect_ratio, image_size,
+                    openai_size=DEFAULT_OPENAI_SIZE,
+                    openai_quality=DEFAULT_OPENAI_QUALITY):
         """Process images through one or more prompts.
 
         *prompts* is a list of (suffix, prompt_text) tuples.
         Output files are named {stem}_{suffix}.png.
+        Provider-aware: dispatches to Gemini or OpenAI based on *provider*.
         """
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1445,8 +1691,14 @@ class App(tk.Tk):
         total_work = total_images * total_prompts
 
         self.after(0, self._log, f"Found {total_images} image(s) in {input_dir}")
-        self.after(0, self._log,
-                   f"Model: {model}  |  Aspect ratio: {aspect_ratio}  |  Resolution: {image_size}")
+        if provider == "OpenAI":
+            self.after(0, self._log,
+                       f"Provider: OpenAI  |  Model: {model}  "
+                       f"|  Size: {openai_size}  |  Quality: {openai_quality}")
+        else:
+            self.after(0, self._log,
+                       f"Provider: Gemini  |  Model: {model}  "
+                       f"|  Aspect ratio: {aspect_ratio}  |  Resolution: {image_size}")
         if total_prompts > 1:
             self.after(0, self._log, f"Running {total_prompts} prompts per image "
                                      f"({total_work} total generations)\n")
@@ -1457,7 +1709,10 @@ class App(tk.Tk):
             self.after(0, self._finish, 0, 0, 0, output_dir)
             return
 
-        client = genai.Client(api_key=api_key)
+        if provider == "OpenAI":
+            client = OpenAI(api_key=api_key)
+        else:
+            client = genai.Client(api_key=api_key)
         succeeded = skipped = failed = 0
         completed = 0
         api_call_times: list[float] = []  # durations of actual API calls
@@ -1498,8 +1753,14 @@ class App(tk.Tk):
                 while attempt < MAX_RETRIES:
                     try:
                         t0 = time.monotonic()
-                        ok = process_image(client, model, prompt_text, image_path,
-                                           output_path, aspect_ratio, image_size)
+                        if provider == "OpenAI":
+                            ok = process_image_openai(
+                                client, model, prompt_text, image_path,
+                                output_path, openai_size, openai_quality)
+                        else:
+                            ok = process_image(
+                                client, model, prompt_text, image_path,
+                                output_path, aspect_ratio, image_size)
                         api_call_times.append(time.monotonic() - t0)
                         if ok:
                             self.after(0, self._log,
